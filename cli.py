@@ -35,6 +35,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
+    late_game = getattr(args, "late_game", False)
 
     if live and paper:
         print("Error: --live and --paper are mutually exclusive.")
@@ -45,6 +46,17 @@ def cmd_run(args: argparse.Namespace) -> None:
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
         print("   This will use real money and place actual trades.")
+
+    # --late-game mode: MLB late-game favorite price-driven strategy
+    if late_game:
+        _run_late_game(
+            live_mode=live_mode,
+            entry=getattr(args, "entry", None),
+            tp=getattr(args, "tp", None),
+            sl=getattr(args, "sl", None),
+            size=getattr(args, "size", None),
+        )
+        return
 
     # --safe-compounder mode: edge-based NO-side only
     if safe_compounder:
@@ -93,6 +105,51 @@ def cmd_run(args: argparse.Namespace) -> None:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         print("\nTrading bot stopped by user.")
+
+
+def _run_late_game(
+    live_mode: bool = False,
+    entry: float | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
+    size: float | None = None,
+) -> None:
+    """Run the MLB late-game favorite strategy."""
+    from src.clients import build_polymarket_clients
+    from src.strategies.late_game_favorite import (
+        LateGameFavoriteConfig,
+        LateGameFavoriteStrategy,
+    )
+
+    cfg = LateGameFavoriteConfig()
+    if entry is not None:
+        cfg.entry_confidence = entry
+    if tp is not None:
+        cfg.take_profit = tp
+    if sl is not None:
+        cfg.stop_loss = sl
+    if size is not None:
+        cfg.trade_size = size
+
+    print("MLB LATE-GAME FAVORITE MODE")
+    print("   Price-driven entry/exit — no LLM, no ESPN")
+    if not live_mode:
+        print("   DRY RUN — no real orders will be placed")
+
+    async def _run():
+        from src.utils.database import DatabaseManager
+        db = DatabaseManager()
+        await db.initialize()
+        async with build_polymarket_clients() as (client, gamma):
+            strategy = LateGameFavoriteStrategy(
+                client=client, gamma=gamma, config=cfg, dry_run=not live_mode, db=db,
+            )
+            await strategy.run()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        print("\nLate-game strategy stopped by user.")
 
 
 def _run_safe_compounder(
@@ -593,7 +650,7 @@ def cmd_health(args: argparse.Namespace) -> None:
             from src.clients.polymarket_client import PolymarketClient
             client = PolymarketClient()
             try:
-                await client._ensure_api_creds()
+                await client._ensure_api_key()
                 ok("Polymarket CLOB auth", "L2 API credentials derived")
             except Exception as exc:
                 fail("Polymarket CLOB auth", str(exc))
@@ -698,6 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
             "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
             "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
+            "  python cli.py run --late-game          MLB Late-Game Favorite: price-driven (paper)\n"
+            "  python cli.py run --late-game --live   MLB Late-Game Favorite with real capital\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
             "  python cli.py status                   Check portfolio balance and positions\n"
@@ -749,6 +808,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="safe_compounder",
         help="Safe Compounder: NO-side only, edge-based, near-certain outcomes",
     )
+    strategy_group.add_argument(
+        "--late-game",
+        action="store_true",
+        dest="late_game",
+        help="MLB Late-Game Favorite: price-driven entry/exit for MLB moneyline markets",
+    )
     p_run.add_argument(
         "--loop",
         action="store_true",
@@ -766,6 +831,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Set logging verbosity (default: INFO)",
+    )
+    # Late-game strategy overrides
+    p_run.add_argument(
+        "--entry",
+        type=float,
+        help="Entry confidence threshold (default: 0.80)",
+    )
+    p_run.add_argument(
+        "--tp",
+        type=float,
+        help="Take-profit percentage (default: 0.80 = +80%%)",
+    )
+    p_run.add_argument(
+        "--sl",
+        type=float,
+        help="Stop-loss percentage (default: 0.13 = -13%%)",
+    )
+    p_run.add_argument(
+        "--size",
+        type=float,
+        help="Trade size in USDC (default: 10)",
     )
     p_run.set_defaults(func=cmd_run)
 

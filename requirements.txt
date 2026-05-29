@@ -13,8 +13,8 @@ cryptography==42.0.0
 pycryptodome==3.20.0
 
 # --- Polymarket (CLOB + on-chain) ---
-# CLOB SDK (order placement, signing, cancellation, orderbook)
-py-clob-client>=0.17.0
+# CLOB V2 SDK (order placement, signing, cancellation, orderbook)
+py-clob-client-v2>=1.0.0
 # web3.py: USDC balance reads, allowances, EIP-712 helpers
 web3>=6.15.0
 # eth-account is pulled in by web3, pinned here for clarity
