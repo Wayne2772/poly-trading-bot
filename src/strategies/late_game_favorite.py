@@ -348,8 +348,8 @@ class LateGameFavoriteStrategy:
             print(f"  [{t}]  {g['title'][:70]}")
         print()
 
+        scan_count = 0
         while self._running:
-            scan_count = 0
             try:
                 for token_id, w in list(self.watchers.items()):
                     if w.state == TokenState.CLOSED:
