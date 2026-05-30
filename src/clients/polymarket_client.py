@@ -835,9 +835,10 @@ class PolymarketClient(TradingLoggerMixin):
         # rejected with `not allowed for this market` if not flagged correctly.
         token_meta = self._token_cache.get(ticker)
         neg_risk = bool(token_meta.neg_risk) if token_meta else False
-        tick_size = float(token_meta.tick_size) if token_meta else 0.01
+        tick_size_val = float(token_meta.tick_size) if token_meta else 0.01
+        tick_size_str = str(tick_size_val)  # SDK expects string like "0.01"
         order_options = PartialCreateOrderOptions(
-            tick_size=tick_size, neg_risk=neg_risk,
+            tick_size=tick_size_str, neg_risk=neg_risk,
         )
 
         # Resolve price hint (cents → dollars). Required for limit orders;
@@ -858,29 +859,26 @@ class PolymarketClient(TradingLoggerMixin):
         # Snap price to the market's tick size; otherwise the CLOB rejects with
         # "invalid price". Most markets are 0.01 ticks (already aligned), but
         # high-volume political markets sometimes use 0.001.
-        if price_dollars is not None and tick_size > 0:
-            price_dollars = round(round(price_dollars / tick_size) * tick_size, 4)
+        if price_dollars is not None and tick_size_val > 0:
+            price_dollars = round(round(price_dollars / tick_size_val) * tick_size_val, 4)
 
         poly_side = BUY if action_l == "buy" else SELL
 
         def _send():
             if type_l == "market":
-                # SDK convention: BUY market amount = USDC dollars,
-                #                 SELL market amount = share count.
                 if poly_side == BUY:
                     if price_dollars is None:
                         raise PolymarketAPIError(
                             "market BUY needs a price hint (yes_price/no_price) "
                             "to compute the USDC spend; pass the current ask."
                         )
-                    amount = count * price_dollars
+                    amount = count * price_dollars  # USDC to spend
                 else:
-                    amount = count
+                    amount = count  # shares to sell
                 args = MarketOrderArgs(
                     token_id=token_id, amount=amount, side=poly_side,
                 )
-                signed = client.create_market_order(args, order_options)
-                return client.post_order(signed, OrderType.FOK)
+                return client.create_and_post_market_order(args, order_options, OrderType.FOK)
             else:
                 args = OrderArgsV2(
                     token_id=token_id,
@@ -888,8 +886,7 @@ class PolymarketClient(TradingLoggerMixin):
                     size=count,
                     side=poly_side,
                 )
-                signed = client.create_order(args, order_options)
-                return client.post_order(signed, OrderType.GTC)
+                return client.create_and_post_order(args, order_options, OrderType.GTC)
 
         try:
             resp = await asyncio.to_thread(_send)
@@ -1172,7 +1169,13 @@ def _classify_order_error(exc: Exception) -> Exception:
         return RateLimitError(str(exc))
     if "signature" in msg or "unauthorized" in msg or "401" in msg:
         return PolymarketAuthError(str(exc))
-    return PolymarketAPIError(f"order failed: {exc}")
+    # Include raw exception details for debugging
+    raw_msg = str(exc)
+    if hasattr(exc, 'error_msg'):
+        raw_msg += f" | error_msg={getattr(exc, 'error_msg', '')}"
+    if hasattr(exc, 'status_code'):
+        raw_msg += f" | status_code={getattr(exc, 'status_code', '')}"
+    return PolymarketAPIError(f"order failed: {raw_msg}")
 
 
 def _normalize_order_response(

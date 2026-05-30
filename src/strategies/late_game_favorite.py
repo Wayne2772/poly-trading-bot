@@ -54,6 +54,23 @@ SKIP_TITLE_KEYWORDS = [
 ]
 
 
+def _parse_game_time(raw: str) -> float:
+    """Parse a game start time string to a Unix timestamp. Returns 0 on failure."""
+    if not raw:
+        return 0.0
+    try:
+        s = raw.strip().replace(" ", "T", 1)
+        if "+" in s:
+            tz_part = s.rsplit("+", 1)[-1]
+            if len(tz_part) == 2:
+                s += ":00"
+        elif s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _is_mlb_moneyline(title: str) -> bool:
     t = title.lower()
     if any(kw in t for kw in SKIP_TITLE_KEYWORDS):
@@ -70,14 +87,14 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class LateGameFavoriteConfig:
-    entry_confidence: float = 0.85
+    entry_confidence: float = 0.88
     game_over_high: float = 0.99
     game_over_low: float = 0.01
     take_profit: float = 0.80    # +80% from entry
-    stop_loss: float = 0.10      # -10% from entry
-    trade_size: float = 1.5     # USDC per trade
+    stop_loss: float = 0.15      # -10% from entry
+    trade_size: float = 5     # shares per trade
     poll_interval: int = 3       # seconds between price polls
-    max_games: int = 10          # max concurrent games to track
+    max_games: int = 20          # max concurrent games to track
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +118,7 @@ class TokenWatcher:
     state: TokenState = TokenState.WATCHING
     current_price: float = 0.0
     entry_price: float = 0.0
+    peak_price: float = 0.0  # highest price since entry (trailing stop reference)
     shares: int = 0
     order_id: str = ""
     pnl: float = 0.0
@@ -117,12 +135,19 @@ class TokenWatcher:
         elif self.state == TokenState.IN_POSITION:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
                 return "EXIT_GAMEOVER"
+            # Update trailing stop peak
+            if price > self.peak_price:
+                self.peak_price = price
             if self.entry_price > 0:
+                # Take-profit: based on entry price
                 pnl_pct = (price - self.entry_price) / self.entry_price
                 if pnl_pct >= cfg.take_profit:
                     return "EXIT_TP"
-                if pnl_pct <= -cfg.stop_loss:
-                    return "EXIT_SL"
+                # Stop-loss: trailing — based on peak price
+                if self.peak_price > 0:
+                    drawdown = (price - self.peak_price) / self.peak_price
+                    if drawdown <= -cfg.stop_loss:
+                        return "EXIT_SL"
 
         return None
 
@@ -210,6 +235,11 @@ class LateGameFavoriteStrategy:
                         tick_size = float(m.get("orderPriceMinTickSize", 0.01) or 0.01)
                         self.client.register_market(cond, yes_id, no_id,
                                                     neg_risk=neg_risk, tick_size=tick_size)
+
+                        # Parse game start time for sorting (format: "2026-05-21 23:05:00+00")
+                        game_time_raw = m.get("gameStartTime") or ""
+                        game_ts = _parse_game_time(game_time_raw)
+
                         all_markets.append({
                             "condition_id": cond,
                             "title": title,
@@ -217,9 +247,18 @@ class LateGameFavoriteStrategy:
                             "no_token": no_id,
                             "neg_risk": neg_risk,
                             "volume": float(m.get("volumeNum") or m.get("volume") or 0),
+                            "game_start": game_ts,
                         })
 
-        all_markets.sort(key=lambda x: -x["volume"])
+        # Sort by distance from now — in-progress and soon-starting first
+        now = datetime.now(timezone.utc).timestamp()
+        def _sort_key(m: dict) -> tuple:
+            ts = m.get("game_start") or 0
+            if ts == 0:
+                return (2, 0)  # no time → end
+            return (0, abs(ts - now))  # closest to now first
+
+        all_markets.sort(key=_sort_key)
         all_markets = all_markets[:self.config.max_games]
         logger.info("Found %d MLB moneyline markets", len(all_markets))
         return all_markets
@@ -270,7 +309,7 @@ class LateGameFavoriteStrategy:
         print(f"  Entry: price >= {cfg.entry_confidence}")
         print(f"  Exit:  TP +{cfg.take_profit*100:.0f}% | SL -{cfg.stop_loss*100:.0f}%")
         print(f"         Game-over >= {cfg.game_over_high} / <= {cfg.game_over_low}")
-        print(f"  Size:  ${cfg.trade_size:.0f} | Poll: {cfg.poll_interval}s")
+        print(f"  Size:  {cfg.trade_size:.0f} shares | Poll: {cfg.poll_interval}s")
         print(f"{'='*60}\n")
 
         games = await self.discover_games()
@@ -281,25 +320,36 @@ class LateGameFavoriteStrategy:
         self.watchers.clear()
         for g in games:
             away, home = self._extract_teams(g["title"])
+            game_ts = g.get("game_start") or 0
+            time_str = datetime.fromtimestamp(game_ts, tz=timezone.utc).strftime("%m-%d %H:%M") if game_ts else "no time"
+            label_away = f"{away} ({time_str})"
+            label_home = f"{home} ({time_str})"
             # YES token = bet on away team (first mentioned in "Will X beat Y?")
             self.watchers[g["yes_token"]] = TokenWatcher(
                 token_id=g["yes_token"], condition_id=g["condition_id"],
-                side="yes", label=f"{away} (AWAY)", market_title=g["title"],
+                side="yes", label=label_away, market_title=g["title"],
                 neg_risk=g["neg_risk"],
             )
             # NO token = bet on home team (second mentioned)
             self.watchers[g["no_token"]] = TokenWatcher(
                 token_id=g["no_token"], condition_id=g["condition_id"],
-                side="no", label=f"{home} (HOME)", market_title=g["title"],
+                side="no", label=label_home, market_title=g["title"],
                 neg_risk=g["neg_risk"],
             )
 
+        # Check for orphaned positions from a previous run
+        if not self.dry_run:
+            await self._restore_positions()
+
         print(f"Tracking {len(self.watchers)} tokens across {len(games)} games:\n")
-        for w in self.watchers.values():
-            print(f"  [{w.label}]  {w.market_title[:70]}")
+        for g in games:
+            ts = g.get("game_start") or 0
+            t = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M UTC") if ts else "no time"
+            print(f"  [{t}]  {g['title'][:70]}")
         print()
 
         while self._running:
+            scan_count = 0
             try:
                 for token_id, w in list(self.watchers.items()):
                     if w.state == TokenState.CLOSED:
@@ -320,6 +370,20 @@ class LateGameFavoriteStrategy:
                         logger.info("[%s] Game over before entry", w.label)
                     elif signal in ("EXIT_TP", "EXIT_SL", "EXIT_GAMEOVER"):
                         await self._handle_exit(w, signal)
+
+                scan_count += 1
+                # Heartbeat every 60s (12 scans × 5s)
+                if scan_count % 12 == 0:
+                    active = sum(1 for w in self.watchers.values() if w.state == TokenState.WATCHING)
+                    in_pos = sum(1 for w in self.watchers.values() if w.state == TokenState.IN_POSITION)
+                    closed = sum(1 for w in self.watchers.values() if w.state == TokenState.CLOSED)
+                    best = max(
+                        (w for w in self.watchers.values() if w.state == TokenState.WATCHING and w.current_price > 0),
+                        key=lambda w: w.current_price, default=None,
+                    )
+                    best_info = f"  best={best.label}:{best.current_price:.4f}" if best else ""
+                    print(f"  [{datetime.now(timezone.utc).strftime('%H:%M:%S')}] scan #{scan_count} | "
+                          f"watching={active} holding={in_pos} closed={closed}{best_info}")
 
                 await asyncio.sleep(cfg.poll_interval)
 
@@ -358,12 +422,59 @@ class LateGameFavoriteStrategy:
             print(f"  Database:             trading_system.db")
         print(f"{'='*60}\n")
 
+    async def _restore_positions(self) -> None:
+        """Restore open positions from a previous bot run.
+
+        Queries the Polymarket Data API for open positions of the funder.
+        For any active position whose condition_id matches a discovered
+        game, creates a TokenWatcher in IN_POSITION state so the bot
+        resumes monitoring (take-profit / stop-loss / game-over).
+        """
+        try:
+            resp = await self.client.get_positions()
+        except Exception as e:
+            logger.warning("Could not fetch positions: %s", e)
+            return
+
+        positions = resp.get("market_positions", [])
+        active = [p for p in positions if float(p.get("size", 0)) > 0]
+        if not active:
+            return
+
+        print(f"\nFound {len(active)} open position(s) from previous run:")
+        for p in active:
+            cond = p.get("condition_id", "")
+            token_id = p.get("token_id", "")
+            side = p.get("side", "").lower()
+            size = int(float(p.get("size", 0)))
+            avg_price = float(p.get("avg_price", 0))
+
+            # Only restore if this is in our watchers (MLB game)
+            w = self.watchers.get(token_id)
+            if w is None:
+                self.watchers[token_id] = TokenWatcher(
+                    token_id=token_id, condition_id=cond,
+                    side=side, label=f"{cond[:10]}... ({side.upper()})",
+                    market_title=cond, neg_risk=False,
+                    state=TokenState.IN_POSITION, entry_price=avg_price,
+                    peak_price=avg_price, shares=size,
+                )
+                w = self.watchers[token_id]
+
+            w.state = TokenState.IN_POSITION
+            w.entry_price = avg_price
+            w.peak_price = avg_price
+            w.shares = size
+            print(f"  [{w.label}] {side.upper()} entry={avg_price:.4f} x{size}")
+
+        print()
+
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
 
-    def _compute_shares(self, price: float) -> int:
-        return max(1, int(self.config.trade_size / price))
+    def _compute_shares(self) -> int:
+        return max(1, int(self.config.trade_size))
 
     def _log_trade(
         self, w: TokenWatcher, action: str, shares: int, price: float,
@@ -408,7 +519,7 @@ class LateGameFavoriteStrategy:
         cfg = self.config
         if w.current_price <= 0:
             return
-        shares = self._compute_shares(w.current_price)
+        shares = self._compute_shares()
         entry_price = w.current_price
         entry_time = datetime.now(timezone.utc)
 
@@ -420,6 +531,7 @@ class LateGameFavoriteStrategy:
                   f"@ {entry_price:.4f} (~${shares * entry_price:.2f})")
             w.state = TokenState.IN_POSITION
             w.entry_price = entry_price
+            w.peak_price = entry_price
             w.shares = shares
             self._open_trades[w.token_id] = entry_time
             self._log_trade(w, "ENTRY", shares, entry_price, 0, 0, entry_time)
@@ -452,7 +564,8 @@ class LateGameFavoriteStrategy:
             self._open_trades[w.token_id] = entry_time
             self._log_trade(w, "ENTRY", shares, entry_price, 0, 0, entry_time)
         except Exception as e:
-            logger.error("[%s] Entry failed: %s", w.label, e)
+            logger.error("[%s] Entry failed: %s | price=%.4f shares=%d side=%s",
+                         w.label, e, w.current_price, shares, w.side)
 
     async def _handle_exit(self, w: TokenWatcher, signal: str) -> None:
         exit_price = w.current_price
