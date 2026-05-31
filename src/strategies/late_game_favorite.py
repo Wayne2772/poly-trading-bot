@@ -71,6 +71,27 @@ def _parse_game_time(raw: str) -> float:
         return 0.0
 
 
+def _is_active_window(start_utc: str, end_utc: str) -> bool:
+    """Check if current UTC time falls within the active trading window.
+
+    Handles cross-midnight windows (e.g. 22:00–05:00). Empty strings
+    mean always active.
+    """
+    if not start_utc or not end_utc:
+        return True
+    try:
+        now = datetime.now(timezone.utc).time()
+        start = datetime.strptime(start_utc, "%H:%M").time()
+        end = datetime.strptime(end_utc, "%H:%M").time()
+    except ValueError:
+        return True  # invalid format → always active
+
+    if start <= end:
+        return start <= now <= end
+    else:
+        return now >= start or now <= end  # cross-midnight
+
+
 def _is_mlb_moneyline(title: str) -> bool:
     t = title.lower()
     if any(kw in t for kw in SKIP_TITLE_KEYWORDS):
@@ -87,14 +108,17 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class LateGameFavoriteConfig:
-    entry_confidence: float = 0.88
-    game_over_high: float = 0.99
-    game_over_low: float = 0.01
+    entry_confidence: float = 0.875
+    game_over_high: float = 0.999
+    game_over_low: float = 0.001
     take_profit: float = 0.80    # +80% from entry
-    stop_loss: float = 0.15      # -10% from entry
-    trade_size: float = 5     # shares per trade
+    stop_loss: float = 0.10      # -10% from entry
+    trade_size: float = 6     # shares per trade
     poll_interval: int = 3       # seconds between price polls
     max_games: int = 20          # max concurrent games to track
+    active_start_utc: str = ""   # e.g. "22:00" — only trade from this UTC time
+    active_end_utc: str = ""     # e.g. "05:00" — stop trading at this UTC time
+                                  # leave both empty for always-on
 
 
 # ---------------------------------------------------------------------------
@@ -122,19 +146,22 @@ class TokenWatcher:
     shares: int = 0
     order_id: str = ""
     pnl: float = 0.0
+    cooldown_scans: int = 0  # scans to wait before allowing re-entry
 
     def update_price(self, price: float, cfg: "LateGameFavoriteConfig") -> Optional[str]:
         self.current_price = price
+        if self.cooldown_scans > 0:
+            self.cooldown_scans -= 1
 
         if self.state == TokenState.WATCHING:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                return "EXIT_GAMEOVER"
-            if price >= cfg.entry_confidence:
+                return "GAME_OVER"
+            if self.cooldown_scans <= 0 and price >= cfg.entry_confidence:
                 return "ENTRY"
 
         elif self.state == TokenState.IN_POSITION:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                return "EXIT_GAMEOVER"
+                return "GAME_OVER"
             # Update trailing stop peak
             if price > self.peak_price:
                 self.peak_price = price
@@ -349,8 +376,21 @@ class LateGameFavoriteStrategy:
         print()
 
         scan_count = 0
+        last_status = None
         while self._running:
             try:
+                # Time-window gate
+                if not _is_active_window(cfg.active_start_utc, cfg.active_end_utc):
+                    status = "OUTSIDE TRADING WINDOW"
+                    if status != last_status:
+                        print(f"\n⏰ {status} — active: {cfg.active_start_utc}–{cfg.active_end_utc} UTC\n")
+                        last_status = status
+                    await asyncio.sleep(30)
+                    continue
+                if last_status:
+                    print(f"\n✅ Entering trading window ({cfg.active_start_utc}–{cfg.active_end_utc} UTC)\n")
+                    last_status = None
+
                 for token_id, w in list(self.watchers.items()):
                     if w.state == TokenState.CLOSED:
                         continue
@@ -365,11 +405,25 @@ class LateGameFavoriteStrategy:
 
                     if signal == "ENTRY":
                         await self._handle_entry(w)
-                    elif signal == "EXIT_GAMEOVER" and w.state == TokenState.WATCHING:
+                    elif signal == "GAME_OVER" and w.state == TokenState.WATCHING:
                         w.state = TokenState.CLOSED
                         logger.info("[%s] Game over before entry", w.label)
-                    elif signal in ("EXIT_TP", "EXIT_SL", "EXIT_GAMEOVER"):
+                    elif signal == "GAME_OVER" and w.state == TokenState.IN_POSITION:
+                        # No sell order — Polymarket settles automatically
+                        if price >= cfg.game_over_high:
+                            pnl = (1.0 - w.entry_price) * w.shares
+                        else:
+                            pnl = (0.0 - w.entry_price) * w.shares
+                        w.pnl = pnl
+                        pnl_pct = (pnl / (w.entry_price * w.shares)) * 100 if w.entry_price > 0 else 0
+                        print(f"  [GAME OVER] {w.label} | settlement PnL=${pnl:+.2f} ({pnl_pct:+.1f}%)")
+                        self._log_trade(w, "GAME_OVER", w.shares, w.current_price, pnl, pnl_pct)
+                        w.state = TokenState.CLOSED
+                    elif signal in ("EXIT_TP", "EXIT_SL"):
                         await self._handle_exit(w, signal)
+                        # Re-entry: reset to WATCHING if game still active
+                        if 0.01 < price < 0.99:
+                            self._reset_watcher(w)
 
                 scan_count += 1
                 # Heartbeat every 60s (12 scans × 5s)
@@ -402,21 +456,42 @@ class LateGameFavoriteStrategy:
                 pass
 
     def _print_summary(self) -> None:
-        """Print trade summary and export path."""
+        """Print trade summary and export path.
+
+        Includes both realized PnL (closed positions, including auto-settled
+        game-over) and unrealized PnL (open positions, mark-to-market).
+        """
         closed = [w for w in self.watchers.values() if w.state == TokenState.CLOSED and w.pnl != 0]
         open_pos = [w for w in self.watchers.values() if w.state == TokenState.IN_POSITION]
-        total_pnl = sum(w.pnl for w in closed)
+        realized_pnl = sum(w.pnl for w in closed)
+
+        # Unrealized MTM for open positions
+        unrealized_pnl = 0.0
+        for w in open_pos:
+            if w.entry_price > 0:
+                unrealized_pnl += (w.current_price - w.entry_price) * w.shares
+
+        total_pnl = realized_pnl + unrealized_pnl
 
         print(f"\n{'='*60}")
         print("TRADE SUMMARY")
         print(f"{'='*60}")
-        print(f"  Total trades closed:  {len(closed)}")
-        print(f"  Open positions:       {len(open_pos)}")
+        print(f"  Trades closed:        {len(closed)} (realized PnL: ${realized_pnl:+.2f})")
+        print(f"  Positions open:       {len(open_pos)} (unrealized MTM: ${unrealized_pnl:+.2f})")
         print(f"  Total PnL:           ${total_pnl:+.2f}")
         if closed:
             wins = sum(1 for w in closed if w.pnl > 0)
             losses = sum(1 for w in closed if w.pnl < 0)
-            print(f"  Wins / Losses:        {wins} / {losses}")
+            settled = sum(1 for w in closed if w.order_id == "" and w.pnl != 0)
+            print(f"  Wins / Losses:        {wins} / {losses}  (auto-settled: {settled})")
+        if open_pos:
+            print()
+            for w in open_pos:
+                if w.entry_price > 0:
+                    mtm = (w.current_price - w.entry_price) * w.shares
+                    mtm_pct = (w.current_price - w.entry_price) / w.entry_price * 100
+                    print(f"  [{w.label}] {w.side.upper()} entry={w.entry_price:.4f} "
+                          f"now={w.current_price:.4f} | MTM=${mtm:+.2f} ({mtm_pct:+.1f}%)")
         print(f"  Trade log:            {self._trade_log_path.resolve()}")
         if self._db:
             print(f"  Database:             trading_system.db")
@@ -472,6 +547,17 @@ class LateGameFavoriteStrategy:
     # ------------------------------------------------------------------
     # Order execution
     # ------------------------------------------------------------------
+
+    def _reset_watcher(self, w: TokenWatcher) -> None:
+        """Reset a closed watcher so it can re-enter on the same game."""
+        w.state = TokenState.WATCHING
+        w.entry_price = 0.0
+        w.peak_price = 0.0
+        w.shares = 0
+        w.order_id = ""
+        w.pnl = 0.0
+        w.cooldown_scans = 10  # ~30s at 3s poll — avoid instant re-entry
+        logger.info("[%s] Reset to WATCHING — can re-enter after cooldown", w.label)
 
     def _compute_shares(self) -> int:
         return max(1, int(self.config.trade_size))
