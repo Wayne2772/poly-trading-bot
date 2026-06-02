@@ -616,30 +616,29 @@ class LateGameFavoriteStrategy:
             logger.error("[%s] Entry failed: %s | price=%.4f shares=%d side=%s",
                          w.label, e, w.current_price, shares, w.side)
 
-    async def _get_actual_shares(self, token_id: str) -> int:
+    async def _get_actual_shares(self, token_id: str) -> float:
         """Query Polymarket Data API for the actual share count held."""
         try:
             resp = await self.client.get_positions()
             for p in resp.get("market_positions", []):
                 if p.get("token_id") == token_id:
-                    return int(float(p.get("size", 0)))
+                    return float(p.get("size", 0))
         except Exception:
             pass
-        return 0
+        return 0.0
 
     async def _handle_exit(self, w: TokenWatcher, signal: str) -> None:
         exit_price = w.current_price
         exit_time = datetime.now(timezone.utc)
 
         # Sell the actual position size, not the expected count
-        actual_shares = w.shares
+        actual_shares = float(w.shares)
         if not self.dry_run:
             pos_count = await self._get_actual_shares(w.token_id)
-            if pos_count > 0 and pos_count < w.shares:
-                logger.info("[%s] Adjusting sell count: expected=%d actual=%d",
-                            w.label, w.shares, pos_count)
+            if pos_count > 0:
                 actual_shares = pos_count
-        if actual_shares <= 0:
+        sell_count = actual_shares
+        if sell_count <= 0:
             logger.warning("[%s] No shares to sell, marking closed", w.label)
             w.state = TokenState.CLOSED
             return
@@ -657,11 +656,11 @@ class LateGameFavoriteStrategy:
         }
         reason = reasons.get(signal, signal)
 
-        logger.info("[%s] %s — price=%.4f shares=%d pnl=$%.2f",
-                    w.label, reason, exit_price, actual_shares, pnl)
+        logger.info("[%s] %s — price=%.4f shares=%.3f sell=%d pnl=$%.2f",
+                    w.label, reason, exit_price, actual_shares, sell_count, pnl)
 
         if self.dry_run:
-            print(f"  [DRY] {reason}: SELL {actual_shares} {w.side.upper()} [{w.label}] "
+            print(f"  [DRY] {reason}: SELL {sell_count} {w.side.upper()} [{w.label}] "
                   f"@ {exit_price:.4f} | PnL=${pnl:+.2f}")
             w.state = TokenState.CLOSED
             w.pnl = pnl
@@ -675,7 +674,7 @@ class LateGameFavoriteStrategy:
                 client_order_id=str(uuid.uuid4()),
                 side=w.side,
                 action="sell",
-                count=actual_shares,
+                count=sell_count,
                 type_="limit",
                 yes_price=price_cents if w.side == "yes" else None,
                 no_price=price_cents if w.side == "no" else None,

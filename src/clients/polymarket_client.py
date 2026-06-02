@@ -785,7 +785,7 @@ class PolymarketClient(TradingLoggerMixin):
         client_order_id: str,
         side: str,                         # "yes" / "no" — outcome side
         action: str,                       # "buy" / "sell"
-        count: int,                        # share count
+        count: float,                      # share count (fractional ok in v2)
         type_: str = "market",             # "market" | "limit"
         yes_price: Optional[int] = None,   # cents (legacy shape)
         no_price: Optional[int] = None,    # cents (legacy shape)
@@ -1185,7 +1185,7 @@ def _normalize_order_response(
     token_id: str,
     side: str,
     action: str,
-    count: int,
+    count: float,
     client_order_id: str,
 ) -> Dict[str, Any]:
     """Wrap the SDK response in a legacy-shaped envelope so existing callers
