@@ -71,27 +71,6 @@ def _parse_game_time(raw: str) -> float:
         return 0.0
 
 
-def _is_active_window(start_utc: str, end_utc: str) -> bool:
-    """Check if current UTC time falls within the active trading window.
-
-    Handles cross-midnight windows (e.g. 22:00–05:00). Empty strings
-    mean always active.
-    """
-    if not start_utc or not end_utc:
-        return True
-    try:
-        now = datetime.now(timezone.utc).time()
-        start = datetime.strptime(start_utc, "%H:%M").time()
-        end = datetime.strptime(end_utc, "%H:%M").time()
-    except ValueError:
-        return True  # invalid format → always active
-
-    if start <= end:
-        return start <= now <= end
-    else:
-        return now >= start or now <= end  # cross-midnight
-
-
 def _is_mlb_moneyline(title: str) -> bool:
     t = title.lower()
     if any(kw in t for kw in SKIP_TITLE_KEYWORDS):
@@ -108,17 +87,14 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class LateGameFavoriteConfig:
-    entry_confidence: float = 0.875
-    game_over_high: float = 0.999
-    game_over_low: float = 0.001
-    take_profit: float = 0.80    # +80% from entry
+    entry_confidence: float = 0.625
+    game_over_high: float = 0.995
+    game_over_low: float = 0.005
+    take_profit: float = 1.00    # +80% from entry
     stop_loss: float = 0.10      # -10% from entry
-    trade_size: float = 6     # shares per trade
+    trade_size: float = 10     # shares per trade
     poll_interval: int = 3       # seconds between price polls
     max_games: int = 20          # max concurrent games to track
-    active_start_utc: str = ""   # e.g. "22:00" — only trade from this UTC time
-    active_end_utc: str = ""     # e.g. "05:00" — stop trading at this UTC time
-                                  # leave both empty for always-on
 
 
 # ---------------------------------------------------------------------------
@@ -376,21 +352,8 @@ class LateGameFavoriteStrategy:
         print()
 
         scan_count = 0
-        last_status = None
         while self._running:
             try:
-                # Time-window gate
-                if not _is_active_window(cfg.active_start_utc, cfg.active_end_utc):
-                    status = "OUTSIDE TRADING WINDOW"
-                    if status != last_status:
-                        print(f"\n⏰ {status} — active: {cfg.active_start_utc}–{cfg.active_end_utc} UTC\n")
-                        last_status = status
-                    await asyncio.sleep(30)
-                    continue
-                if last_status:
-                    print(f"\n✅ Entering trading window ({cfg.active_start_utc}–{cfg.active_end_utc} UTC)\n")
-                    last_status = None
-
                 for token_id, w in list(self.watchers.items()):
                     if w.state == TokenState.CLOSED:
                         continue
@@ -556,7 +519,7 @@ class LateGameFavoriteStrategy:
         w.shares = 0
         w.order_id = ""
         w.pnl = 0.0
-        w.cooldown_scans = 10  # ~30s at 3s poll — avoid instant re-entry
+        w.cooldown_scans = 5  # ~15s at 3s poll — avoid instant re-entry
         logger.info("[%s] Reset to WATCHING — can re-enter after cooldown", w.label)
 
     def _compute_shares(self) -> int:
@@ -653,11 +616,36 @@ class LateGameFavoriteStrategy:
             logger.error("[%s] Entry failed: %s | price=%.4f shares=%d side=%s",
                          w.label, e, w.current_price, shares, w.side)
 
+    async def _get_actual_shares(self, token_id: str) -> int:
+        """Query Polymarket Data API for the actual share count held."""
+        try:
+            resp = await self.client.get_positions()
+            for p in resp.get("market_positions", []):
+                if p.get("token_id") == token_id:
+                    return int(float(p.get("size", 0)))
+        except Exception:
+            pass
+        return 0
+
     async def _handle_exit(self, w: TokenWatcher, signal: str) -> None:
         exit_price = w.current_price
         exit_time = datetime.now(timezone.utc)
+
+        # Sell the actual position size, not the expected count
+        actual_shares = w.shares
+        if not self.dry_run:
+            pos_count = await self._get_actual_shares(w.token_id)
+            if pos_count > 0 and pos_count < w.shares:
+                logger.info("[%s] Adjusting sell count: expected=%d actual=%d",
+                            w.label, w.shares, pos_count)
+                actual_shares = pos_count
+        if actual_shares <= 0:
+            logger.warning("[%s] No shares to sell, marking closed", w.label)
+            w.state = TokenState.CLOSED
+            return
+
         if w.entry_price > 0:
-            pnl = (exit_price - w.entry_price) * w.shares
+            pnl = (exit_price - w.entry_price) * actual_shares
             pnl_pct = (exit_price - w.entry_price) / w.entry_price * 100
         else:
             pnl, pnl_pct = 0.0, 0.0
@@ -669,14 +657,15 @@ class LateGameFavoriteStrategy:
         }
         reason = reasons.get(signal, signal)
 
-        logger.info("[%s] %s — price=%.4f pnl=$%.2f", w.label, reason, exit_price, pnl)
+        logger.info("[%s] %s — price=%.4f shares=%d pnl=$%.2f",
+                    w.label, reason, exit_price, actual_shares, pnl)
 
         if self.dry_run:
-            print(f"  [DRY] {reason}: SELL {w.shares} {w.side.upper()} [{w.label}] "
+            print(f"  [DRY] {reason}: SELL {actual_shares} {w.side.upper()} [{w.label}] "
                   f"@ {exit_price:.4f} | PnL=${pnl:+.2f}")
             w.state = TokenState.CLOSED
             w.pnl = pnl
-            self._log_trade(w, signal, w.shares, exit_price, pnl, pnl_pct, exit_time)
+            self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
             return
 
         try:
@@ -686,7 +675,7 @@ class LateGameFavoriteStrategy:
                 client_order_id=str(uuid.uuid4()),
                 side=w.side,
                 action="sell",
-                count=w.shares,
+                count=actual_shares,
                 type_="limit",
                 yes_price=price_cents if w.side == "yes" else None,
                 no_price=price_cents if w.side == "no" else None,
