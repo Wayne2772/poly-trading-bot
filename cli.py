@@ -36,6 +36,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
     late_game = getattr(args, "late_game", False)
+    lateleader_real = getattr(args, "lateleader_real", False)
 
     if live and paper:
         print("Error: --live and --paper are mutually exclusive.")
@@ -46,6 +47,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
         print("   This will use real money and place actual trades.")
+
+    # --lateleader-real mode: MLB late-leader real strategy
+    if lateleader_real:
+        _run_lateleader_real(
+            live_mode=live_mode,
+            entry_price=getattr(args, "entry_price", None),
+            delay=getattr(args, "delay", None),
+            tp=getattr(args, "tp_price", None),
+            sl=getattr(args, "sl_pct", None),
+            size=getattr(args, "size", None),
+        )
+        return
 
     # --late-game mode: MLB late-game favorite price-driven strategy
     if late_game:
@@ -105,6 +118,54 @@ def cmd_run(args: argparse.Namespace) -> None:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         print("\nTrading bot stopped by user.")
+
+
+def _run_lateleader_real(
+    live_mode: bool = False,
+    entry_price: float | None = None,
+    delay: int | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
+    size: float | None = None,
+) -> None:
+    """Run the MLB late-leader real strategy."""
+    from src.clients import build_polymarket_clients
+    from src.strategies.mlb_lateleader_real import (
+        MLBLateLeaderRealConfig,
+        MLBLateLeaderRealStrategy,
+    )
+
+    cfg = MLBLateLeaderRealConfig()
+    if entry_price is not None:
+        cfg.entry_confidence = entry_price
+    if delay is not None:
+        cfg.entry_delay_minutes = delay
+    if tp is not None:
+        cfg.take_profit_price = tp
+    if sl is not None:
+        cfg.stop_loss_pct = sl
+    if size is not None:
+        cfg.trade_size = size
+
+    print("MLB LATE-LEADER REAL MODE")
+    print("   Delayed entry, absolute TP, fixed SL — no LLM, no ESPN")
+    if not live_mode:
+        print("   DRY RUN — no real orders will be placed")
+
+    async def _run():
+        from src.utils.database import DatabaseManager
+        db = DatabaseManager()
+        await db.initialize()
+        async with build_polymarket_clients() as (client, gamma):
+            strategy = MLBLateLeaderRealStrategy(
+                client=client, gamma=gamma, config=cfg, dry_run=not live_mode, db=db,
+            )
+            await strategy.run()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        print("\nLate-leader real strategy stopped by user.")
 
 
 def _run_late_game(
@@ -757,6 +818,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
             "  python cli.py run --late-game          MLB Late-Game Favorite: price-driven (paper)\n"
             "  python cli.py run --late-game --live   MLB Late-Game Favorite with real capital\n"
+            "  python cli.py run --lateleader-real    MLB Late-Leader Real: delayed entry (paper)\n"
+            "  python cli.py run --lateleader-real --live  MLB Late-Leader Real with real capital\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
             "  python cli.py status                   Check portfolio balance and positions\n"
@@ -814,6 +877,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="late_game",
         help="MLB Late-Game Favorite: price-driven entry/exit for MLB moneyline markets",
     )
+    strategy_group.add_argument(
+        "--lateleader-real",
+        action="store_true",
+        dest="lateleader_real",
+        help="MLB Late-Leader Real: delayed entry, absolute TP, fixed SL for MLB moneyline markets",
+    )
     p_run.add_argument(
         "--loop",
         action="store_true",
@@ -851,7 +920,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--size",
         type=float,
-        help="Trade size in USDC (default: 10)",
+        help="Trade size in shares (default: 6)",
+    )
+    # Late-leader-real strategy overrides
+    p_run.add_argument(
+        "--entry-price",
+        type=float,
+        help="Entry price threshold (default: 0.55)",
+    )
+    p_run.add_argument(
+        "--delay",
+        type=int,
+        help="Minutes after game start before entry allowed (default: 60)",
+    )
+    p_run.add_argument(
+        "--tp-price",
+        type=float,
+        help="Absolute take-profit price (default: 0.93)",
+    )
+    p_run.add_argument(
+        "--sl-pct",
+        type=float,
+        help="Fixed stop-loss percentage from entry (default: 0.15 = -15%%)",
     )
     p_run.set_defaults(func=cmd_run)
 

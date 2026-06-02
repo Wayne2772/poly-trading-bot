@@ -8,6 +8,10 @@ from src.strategies.late_game_favorite import (
     TokenWatcher,
     TokenState,
 )
+from src.strategies.mlb_lateleader_real import (
+    MLBLateLeaderRealConfig,
+    MLBLateLeaderRealStrategy,
+)
 
 __all__ = [
     "CategoryScorer",
@@ -19,4 +23,6 @@ __all__ = [
     "LateGameFavoriteStrategy",
     "TokenWatcher",
     "TokenState",
+    "MLBLateLeaderRealConfig",
+    "MLBLateLeaderRealStrategy",
 ]

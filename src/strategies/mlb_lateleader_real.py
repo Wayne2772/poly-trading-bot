@@ -1,15 +1,18 @@
 """
-MLB Late-Game Favorite Strategy — price-driven entry/exit for prediction markets.
+MLB Late-Leader Real Strategy — delayed entry, absolute take-profit, fixed stop-loss.
 
 Strategy:
   - Monitor both sides (YES/NO tokens) per MLB moneyline game independently.
-  - Enter when token price crosses entry_confidence (0.80), game not over.
-  - Exit on: take-profit (+80%), stop-loss (-13%), or game-over (>=0.99 or <=0.01).
+  - Entry only after `entry_delay_minutes` past game start.
+  - Enter when token price > entry_confidence (0.55).
+  - Exit on: absolute take-profit price (0.93), fixed stop-loss (15% below entry),
+    or game-over (>=0.995 or <=0.005, no sell — Polymarket settles).
 
-In a Polymarket binary "Will X beat Y?" market:
-  - YES token = bet on team X (first mentioned)
-  - NO token  = bet on team Y (second mentioned)
-We track each token's own midpoint price independently.
+Differences from late_game_favorite:
+  - entry_delay_minutes instead of immediate entry after discovery
+  - Absolute take-profit price (0.93) instead of percentage from entry
+  - Fixed stop-loss from entry price instead of trailing stop
+  - No peak_price tracking (no trailing stop)
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import json
 import re
 import time as _time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -32,10 +35,10 @@ from src.clients.polymarket_client import PolymarketClient
 from src.utils.database import DatabaseManager, TradeLog
 from src.utils.logging_setup import get_trading_logger
 
-logger = get_trading_logger("late_game")
+logger = get_trading_logger("lateleader_real")
 
 # ---------------------------------------------------------------------------
-# Market filtering
+# Market filtering (shared with late_game_favorite)
 # ---------------------------------------------------------------------------
 
 MLB_TEAM_KEYWORDS = [
@@ -86,16 +89,16 @@ def _is_mlb_moneyline(title: str) -> bool:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class LateGameFavoriteConfig:
-    entry_confidence: float = 0.685
-    game_over_high: float = 0.995
-    game_over_low: float = 0.005
-    take_profit: float = 1.00    # +100% from entry
-    stop_loss: float = 0.10      # -10% from top value
-    trade_size: float = 6     # shares per trade
-    poll_interval: int = 3       # seconds between price polls
-    max_games: int = 20          # max concurrent games to track
-    confirmation_scans: int = 1  # scans before acting on ENTRY/EXIT signal (~15s)
+class MLBLateLeaderRealConfig:
+    entry_delay_minutes: int = 60     # minutes after game start before entry allowed
+    entry_confidence: float = 0.55    # price must be > this to enter
+    take_profit_price: float = 0.93   # absolute price — exit when price >= this
+    stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
+    game_over_high: float = 0.995     # game decided (win)
+    game_over_low: float = 0.005      # game decided (loss)
+    trade_size: float = 6             # shares per trade
+    poll_interval: int = 3            # seconds between price polls
+    max_games: int = 20               # max concurrent games to track
 
 
 # ---------------------------------------------------------------------------
@@ -110,99 +113,109 @@ class TokenState(Enum):
 
 @dataclass
 class TokenWatcher:
-    token_id: str           # token to buy and monitor
-    condition_id: str       # parent market
+    token_id: str
+    condition_id: str
     side: str               # "yes" or "no"
-    label: str              # e.g. "Dodgers (AWAY)"
+    label: str              # e.g. "Dodgers (06-02 01:40)"
     market_title: str
+    game_start_time: float = 0.0  # unix timestamp, 0 = unknown
     neg_risk: bool = False
     state: TokenState = TokenState.WATCHING
     current_price: float = 0.0
     entry_price: float = 0.0
-    peak_price: float = 0.0  # highest price since entry (trailing stop reference)
     shares: int = 0
     order_id: str = ""
     pnl: float = 0.0
-    cooldown_scans: int = 0  # scans to wait before allowing re-entry
-    pending_signal: str = ""          # signal awaiting confirmation
-    pending_countdown: int = 0        # scans remaining before confirming
+    cooldown_scans: int = 0
+    _delay_warned: bool = field(default=False, repr=False)  # one-shot warning per token
 
-    def update_price(self, price: float, cfg: "LateGameFavoriteConfig") -> Optional[str]:
+    def update_price(
+        self, price: float, cfg: "MLBLateLeaderRealConfig", now_ts: float,
+    ) -> Optional[str]:
+        """Return signal string or None. `now_ts` is current unix time."""
         self.current_price = price
         if self.cooldown_scans > 0:
             self.cooldown_scans -= 1
 
         if self.state == TokenState.WATCHING:
+            # Game-over check first
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                self.pending_signal = ""; self.pending_countdown = 0
-                return "GAME_OVER"  # immediate — game is definitively over
-            if self.cooldown_scans <= 0 and price >= cfg.entry_confidence:
-                return self._confirm("ENTRY", cfg.confirmation_scans)
+                return "GAME_OVER"
+
+            # Entry delay: must be past game_start + entry_delay_minutes
+            if self.game_start_time > 0:
+                eligible_at = self.game_start_time + cfg.entry_delay_minutes * 60
+                if now_ts < eligible_at:
+                    if not self._delay_warned:
+                        remaining = int((eligible_at - now_ts) / 60) + 1
+                        logger.info(
+                            "[%s] Waiting — entry eligible in ~%d min (after %s UTC)",
+                            self.label, remaining,
+                            datetime.fromtimestamp(eligible_at, tz=timezone.utc).strftime("%H:%M"),
+                        )
+                        self._delay_warned = True
+                    return None
             else:
-                self.pending_signal = ""; self.pending_countdown = 0
+                # No game start time — skip this token permanently
+                if not self._delay_warned:
+                    logger.warning(
+                        "[%s] SKIPPED — no gameStartTime from Gamma, cannot determine entry window",
+                        self.label,
+                    )
+                    self._delay_warned = True
+                    self.state = TokenState.CLOSED
+                return None
+
+            # Past delay window — check entry condition
+            if self.cooldown_scans <= 0 and price > cfg.entry_confidence:
+                return "ENTRY"
 
         elif self.state == TokenState.IN_POSITION:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                self.pending_signal = ""; self.pending_countdown = 0
-                return "GAME_OVER"  # immediate
-            # Update trailing stop peak
-            if price > self.peak_price:
-                self.peak_price = price
+                return "GAME_OVER"
+
             if self.entry_price > 0:
-                pnl_pct = (price - self.entry_price) / self.entry_price
-                if pnl_pct >= cfg.take_profit:
-                    return self._confirm("EXIT_TP", cfg.confirmation_scans)
-                if self.peak_price > 0:
-                    drawdown = (price - self.peak_price) / self.peak_price
-                    if drawdown <= -cfg.stop_loss:
-                        return self._confirm("EXIT_SL", cfg.confirmation_scans)
-                # Signal no longer valid — clear pending
-                self.pending_signal = ""; self.pending_countdown = 0
+                # Absolute take-profit
+                if price >= cfg.take_profit_price:
+                    return "EXIT_TP"
+                # Fixed stop-loss from entry
+                stop_price = self.entry_price * (1.0 - cfg.stop_loss_pct)
+                if price <= stop_price:
+                    return "EXIT_SL"
 
         return None
-
-    def _confirm(self, signal: str, wait_scans: int) -> Optional[str]:
-        """Require `wait_scans` of the same signal before returning it."""
-        if self.pending_signal == signal and self.pending_countdown > 0:
-            self.pending_countdown -= 1
-            if self.pending_countdown == 0:
-                self.pending_signal = ""
-                return signal  # confirmed
-            return None  # still waiting
-        # First detection or different signal — start countdown
-        self.pending_signal = signal
-        self.pending_countdown = wait_scans
-        return None  # not yet confirmed
 
 
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
 
-class LateGameFavoriteStrategy:
-    """MLB late-game favorite — multi-game, price-driven entry/exit."""
+class MLBLateLeaderRealStrategy:
+    """MLB late-leader real — delayed entry, absolute TP, fixed SL."""
 
     def __init__(
         self,
         client: PolymarketClient,
         gamma: Optional[GammaClient] = None,
-        config: Optional[LateGameFavoriteConfig] = None,
+        config: Optional[MLBLateLeaderRealConfig] = None,
         dry_run: bool = True,
         db: Optional[DatabaseManager] = None,
     ):
         self.client = client
         self.gamma = gamma or GammaClient()
         self._owns_gamma = gamma is None
-        self.config = config or LateGameFavoriteConfig()
+        self.config = config or MLBLateLeaderRealConfig()
         self.dry_run = dry_run
         self.watchers: Dict[str, TokenWatcher] = {}
         self._running = False
         self._db = db
-        self._trade_log_path = Path(__file__).resolve().parent.parent.parent / "late_game_trades.log"
-        self._open_trades: Dict[str, datetime] = {}  # token_id → entry time
-        self._blocklist_path = Path(__file__).resolve().parent.parent.parent / "late_game_blocklist.txt"
+        self._trade_log_path = Path(__file__).resolve().parent.parent.parent / "mlb_lateleader_real_trades.log"
+        self._open_trades: Dict[str, datetime] = {}
+        self._blocklist_path = Path(__file__).resolve().parent.parent.parent / "mlb_lateleader_real_blocklist.txt"
         self._blocked: set[str] = set()
         self._blocklist_mtime: float = 0.0
+        self._output_dir = Path(__file__).resolve().parent.parent.parent / "output"
+        self._price_files: Dict[str, Path] = {}  # condition_id → jsonl path
         self._realized_pnl: float = 0.0
         self._total_wins: int = 0
         self._total_losses: int = 0
@@ -244,7 +257,6 @@ class LateGameFavoriteStrategy:
                             continue
                         if not m.get("acceptingOrders", True):
                             continue
-                        # Only moneyline: has vs/beat, no O/U or props
                         if not _is_mlb_moneyline(title):
                             continue
                         seen.add(cond)
@@ -265,7 +277,6 @@ class LateGameFavoriteStrategy:
                         self.client.register_market(cond, yes_id, no_id,
                                                     neg_risk=neg_risk, tick_size=tick_size)
 
-                        # Parse game start time for sorting (format: "2026-05-21 23:05:00+00")
                         game_time_raw = m.get("gameStartTime") or ""
                         game_ts = _parse_game_time(game_time_raw)
 
@@ -284,8 +295,8 @@ class LateGameFavoriteStrategy:
         def _sort_key(m: dict) -> tuple:
             ts = m.get("game_start") or 0
             if ts == 0:
-                return (2, 0)  # no time → end
-            return (0, abs(ts - now))  # closest to now first
+                return (2, 0)
+            return (0, abs(ts - now))
 
         all_markets.sort(key=_sort_key)
         all_markets = all_markets[:self.config.max_games]
@@ -324,6 +335,24 @@ class LateGameFavoriteStrategy:
             pass
         return None
 
+    def _write_price(self, token_id: str, w: TokenWatcher, price: float) -> None:
+        """Append one price observation to the game's JSONL file."""
+        filepath = self._price_files.get(w.condition_id)
+        if not filepath:
+            return
+        record = json.dumps({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "token_id": token_id,
+            "label": w.label,
+            "side": w.side,
+            "price": price,
+        })
+        try:
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(record + "\n")
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -334,11 +363,13 @@ class LateGameFavoriteStrategy:
         mode = "DRY RUN" if self.dry_run else "LIVE"
 
         print(f"\n{'='*60}")
-        print(f"MLB LATE-GAME FAVORITE — {mode}")
-        print(f"  Entry: price >= {cfg.entry_confidence}")
-        print(f"  Exit:  TP +{cfg.take_profit*100:.0f}% | SL -{cfg.stop_loss*100:.0f}%")
-        print(f"         Game-over >= {cfg.game_over_high} / <= {cfg.game_over_low}")
-        print(f"  Size:  {cfg.trade_size:.0f} shares | Poll: {cfg.poll_interval}s")
+        print(f"MLB LATE-LEADER REAL — {mode}")
+        print(f"  Entry delay:  {cfg.entry_delay_minutes} min after game start")
+        print(f"  Entry price:  > {cfg.entry_confidence}")
+        print(f"  Take-profit:  price >= {cfg.take_profit_price}")
+        print(f"  Stop-loss:    -{cfg.stop_loss_pct*100:.0f}% from entry (fixed)")
+        print(f"  Game-over:    >= {cfg.game_over_high} / <= {cfg.game_over_low}")
+        print(f"  Size:         {cfg.trade_size:.0f} shares | Poll: {cfg.poll_interval}s")
         print(f"{'='*60}\n")
 
         games = await self.discover_games()
@@ -347,33 +378,66 @@ class LateGameFavoriteStrategy:
             return
 
         self.watchers.clear()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        skipped_no_time = 0
+
         for g in games:
             away, home = self._extract_teams(g["title"])
             game_ts = g.get("game_start") or 0
             time_str = datetime.fromtimestamp(game_ts, tz=timezone.utc).strftime("%m-%d %H:%M") if game_ts else "no time"
             label_away = f"{away} ({time_str})"
             label_home = f"{home} ({time_str})"
+
+            if game_ts == 0:
+                skipped_no_time += 1
+
             # YES token = bet on away team (first mentioned in "Will X beat Y?")
             self.watchers[g["yes_token"]] = TokenWatcher(
                 token_id=g["yes_token"], condition_id=g["condition_id"],
                 side="yes", label=label_away, market_title=g["title"],
-                neg_risk=g["neg_risk"],
+                game_start_time=game_ts, neg_risk=g["neg_risk"],
             )
             # NO token = bet on home team (second mentioned)
             self.watchers[g["no_token"]] = TokenWatcher(
                 token_id=g["no_token"], condition_id=g["condition_id"],
                 side="no", label=label_home, market_title=g["title"],
-                neg_risk=g["neg_risk"],
+                game_start_time=game_ts, neg_risk=g["neg_risk"],
             )
+
+        if skipped_no_time > 0:
+            print(f"⚠️  {skipped_no_time} game(s) have no gameStartTime — these will be skipped at entry.\n")
+
+        # Set up price data output — one JSONL per game
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        for g in games:
+            if g.get("game_start", 0) == 0:
+                continue  # no output for games without start time
+            cond = g["condition_id"]
+            away, home = self._extract_teams(g["title"])
+            safe = f"{away}_vs_{home}".replace(" ", "_").replace(".", "").replace("/", "_")[:60]
+            filename = f"mlb_prices_{date_str}_{safe}_{cond[:8]}.jsonl"
+            self._price_files[cond] = self._output_dir / filename
+        print(f"Price data → {self._output_dir}/ ({len(self._price_files)} game files)\n")
 
         # Check for orphaned positions from a previous run
         if not self.dry_run:
             await self._restore_positions()
 
+        # Summarize entry windows
         print(f"Tracking {len(self.watchers)} tokens across {len(games)} games:\n")
         for g in games:
             ts = g.get("game_start") or 0
-            t = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M UTC") if ts else "no time"
+            if ts == 0:
+                t = "no time — SKIPPED"
+            else:
+                t = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%M UTC")
+                eligible = ts + cfg.entry_delay_minutes * 60
+                if now_ts < eligible:
+                    remaining = int((eligible - now_ts) / 60) + 1
+                    t += f"  (entry in ~{remaining} min)"
+                else:
+                    t += "  (entry window OPEN)"
             print(f"  [{t}]  {g['title'][:70]}")
         print()
 
@@ -381,12 +445,12 @@ class LateGameFavoriteStrategy:
         while self._running:
             try:
                 self._reload_blocklist()
+                now_ts = datetime.now(timezone.utc).timestamp()
 
                 for token_id, w in list(self.watchers.items()):
                     if w.state == TokenState.CLOSED:
                         continue
 
-                    # Hot-reload blocklist: skip if token or team is blocked
                     if self._blocked:
                         if token_id in self._blocked or w.label.lower() in self._blocked:
                             continue
@@ -395,7 +459,9 @@ class LateGameFavoriteStrategy:
                     if price is None:
                         continue
 
-                    signal = w.update_price(price, self.config)
+                    self._write_price(token_id, w, price)
+
+                    signal = w.update_price(price, self.config, now_ts)
                     if signal is None:
                         continue
 
@@ -405,7 +471,6 @@ class LateGameFavoriteStrategy:
                         w.state = TokenState.CLOSED
                         logger.info("[%s] Game over before entry", w.label)
                     elif signal == "GAME_OVER" and w.state == TokenState.IN_POSITION:
-                        # No sell order — Polymarket settles automatically
                         if price >= cfg.game_over_high:
                             pnl = (1.0 - w.entry_price) * w.shares
                         else:
@@ -420,12 +485,10 @@ class LateGameFavoriteStrategy:
                         w.state = TokenState.CLOSED
                     elif signal in ("EXIT_TP", "EXIT_SL"):
                         await self._handle_exit(w, signal)
-                        # Re-entry: reset to WATCHING if game still active
                         if 0.01 < price < 0.99:
                             self._reset_watcher(w)
 
                 scan_count += 1
-                # Heartbeat every 60s (12 scans × 5s)
                 if scan_count % 12 == 0:
                     active = sum(1 for w in self.watchers.values() if w.state == TokenState.WATCHING)
                     in_pos = sum(1 for w in self.watchers.values() if w.state == TokenState.IN_POSITION)
@@ -455,13 +518,7 @@ class LateGameFavoriteStrategy:
                 pass
 
     def _print_summary(self) -> None:
-        """Print trade summary and export path.
-
-        Uses persistent accumulators so re-entry resets don't lose PnL counts.
-        """
         open_pos = [w for w in self.watchers.values() if w.state == TokenState.IN_POSITION]
-
-        # Unrealized MTM for open positions
         unrealized_pnl = 0.0
         for w in open_pos:
             if w.entry_price > 0:
@@ -490,13 +547,7 @@ class LateGameFavoriteStrategy:
         print(f"{'='*60}\n")
 
     async def _restore_positions(self) -> None:
-        """Restore open positions from a previous bot run.
-
-        Queries the Polymarket Data API for open positions of the funder.
-        For any active position whose condition_id matches a discovered
-        game, creates a TokenWatcher in IN_POSITION state so the bot
-        resumes monitoring (take-profit / stop-loss / game-over).
-        """
+        """Restore open positions from a previous bot run."""
         try:
             resp = await self.client.get_positions()
         except Exception as e:
@@ -516,7 +567,6 @@ class LateGameFavoriteStrategy:
             size = int(float(p.get("size", 0)))
             avg_price = float(p.get("avg_price", 0))
 
-            # Only restore if this is in our watchers (MLB game)
             w = self.watchers.get(token_id)
             if w is None:
                 self.watchers[token_id] = TokenWatcher(
@@ -524,13 +574,12 @@ class LateGameFavoriteStrategy:
                     side=side, label=f"{cond[:10]}... ({side.upper()})",
                     market_title=cond, neg_risk=False,
                     state=TokenState.IN_POSITION, entry_price=avg_price,
-                    peak_price=avg_price, shares=size,
+                    shares=size,
                 )
                 w = self.watchers[token_id]
 
             w.state = TokenState.IN_POSITION
             w.entry_price = avg_price
-            w.peak_price = avg_price
             w.shares = size
             print(f"  [{w.label}] {side.upper()} entry={avg_price:.4f} x{size}")
 
@@ -541,7 +590,6 @@ class LateGameFavoriteStrategy:
     # ------------------------------------------------------------------
 
     def _reload_blocklist(self) -> None:
-        """Reload the blocklist file if it changed. Watched every scan."""
         try:
             stat = self._blocklist_path.stat()
             if stat.st_mtime <= self._blocklist_mtime:
@@ -563,14 +611,13 @@ class LateGameFavoriteStrategy:
         self._blocked = blocked
 
     def _reset_watcher(self, w: TokenWatcher) -> None:
-        """Reset a closed watcher so it can re-enter on the same game."""
         w.state = TokenState.WATCHING
         w.entry_price = 0.0
-        w.peak_price = 0.0
         w.shares = 0
         w.order_id = ""
         w.pnl = 0.0
-        w.cooldown_scans = 5  # ~15s at 3s poll — avoid instant re-entry
+        w.cooldown_scans = 5
+        w._delay_warned = False  # re-check entry window on re-entry
         logger.info("[%s] Reset to WATCHING — can re-enter after cooldown", w.label)
 
     def _compute_shares(self) -> int:
@@ -580,7 +627,6 @@ class LateGameFavoriteStrategy:
         self, w: TokenWatcher, action: str, shares: int, price: float,
         pnl: float, pnl_pct: float, ts: datetime | None = None,
     ) -> None:
-        """Write trade event to both the text log file and the database."""
         ts = ts or datetime.now(timezone.utc)
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
         line = (
@@ -594,7 +640,6 @@ class LateGameFavoriteStrategy:
         except Exception:
             pass
 
-        # Write to database (only when position closes or entry)
         if self._db is not None:
             try:
                 if action in ("EXIT_TP", "EXIT_SL", "EXIT_GAMEOVER"):
@@ -609,7 +654,7 @@ class LateGameFavoriteStrategy:
                         entry_timestamp=entry_ts,
                         exit_timestamp=ts,
                         rationale=action,
-                        strategy="late_game_favorite",
+                        strategy="mlb_lateleader_real",
                     )
                     asyncio.ensure_future(self._db.add_trade_log(trade))
             except Exception:
@@ -623,15 +668,17 @@ class LateGameFavoriteStrategy:
         entry_price = w.current_price
         entry_time = datetime.now(timezone.utc)
 
-        logger.info("[%s] ENTRY — price=%.4f shares=%d cost=$%.2f",
-                     w.label, entry_price, shares, shares * entry_price)
+        stop_price = entry_price * (1.0 - cfg.stop_loss_pct)
+        logger.info("[%s] ENTRY — price=%.4f shares=%d cost=$%.2f | SL=%.4f TP=%.4f",
+                     w.label, entry_price, shares, shares * entry_price,
+                     stop_price, cfg.take_profit_price)
 
         if self.dry_run:
             print(f"  [DRY] BUY {shares} {w.side.upper()} [{w.label}] "
-                  f"@ {entry_price:.4f} (~${shares * entry_price:.2f})")
+                  f"@ {entry_price:.4f} (~${shares * entry_price:.2f}) | SL=%.4f TP=%.4f"
+                  % (stop_price, cfg.take_profit_price))
             w.state = TokenState.IN_POSITION
             w.entry_price = entry_price
-            w.peak_price = entry_price
             w.shares = shares
             self._open_trades[w.token_id] = entry_time
             self._log_trade(w, "ENTRY", shares, entry_price, 0, 0, entry_time)
@@ -669,26 +716,15 @@ class LateGameFavoriteStrategy:
 
     @staticmethod
     def _normalize_token_id(token_id: str) -> str:
-        """Convert token_id to decimal string for comparison with Data API.
-
-        Gamma returns hex (e.g., 0x9b3c...), Data API returns decimal
-        (e.g., 926760...). Normalize both to decimal for matching.
-        """
         tid = token_id.strip()
         if tid.startswith("0x") or tid.startswith("0X"):
             try:
                 return str(int(tid, 16))
             except ValueError:
                 pass
-        # Already decimal or unknown — return as-is
         return tid
 
     async def _get_actual_shares(self, token_id: str) -> float:
-        """Query Polymarket Data API for the actual share count held.
-
-        The Data API returns token IDs as decimal strings, while Gamma uses
-        hex. We normalise both sides to decimal for comparison.
-        """
         dec_tid = self._normalize_token_id(token_id)
         try:
             resp = await self.client.get_positions()
@@ -709,7 +745,6 @@ class LateGameFavoriteStrategy:
         exit_price = w.current_price
         exit_time = datetime.now(timezone.utc)
 
-        # Sell the actual position size, not the expected count
         actual_shares = float(w.shares)
         if not self.dry_run:
             pos_count = await self._get_actual_shares(w.token_id)
@@ -728,7 +763,7 @@ class LateGameFavoriteStrategy:
             pnl, pnl_pct = 0.0, 0.0
 
         reasons = {
-            "EXIT_TP": f"Take-profit +{pnl_pct:.0f}%",
+            "EXIT_TP": f"Take-profit ${exit_price:.4f}",
             "EXIT_SL": f"Stop-loss {pnl_pct:.0f}%",
             "EXIT_GAMEOVER": "Game over",
         }
