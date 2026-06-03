@@ -540,7 +540,8 @@ class MLBLateLeaderRealStrategy:
                         w.state = TokenState.CLOSED
                     elif signal in ("EXIT_TP", "EXIT_SL"):
                         await self._handle_exit(w, signal)
-                        if 0.01 < price < 0.99:
+                        # Only reset for re-entry if exit actually succeeded
+                        if w.state == TokenState.CLOSED and 0.01 < price < 0.99:
                             self._reset_watcher(w)
 
                 scan_count += 1
@@ -671,8 +672,16 @@ class MLBLateLeaderRealStrategy:
         w.shares = 0
         w.order_id = ""
         w.pnl = 0.0
+        w.pending_action = ""; w.pending_countdown = 0; w._skip_confirm = False
         w._delay_warned = False  # re-check entry window on re-entry
         logger.info("[%s] Reset to WATCHING — ready for re-entry", w.label)
+
+    @staticmethod
+    def _is_fatal_error(msg: str) -> bool:
+        """Return True for errors that won't be fixed by retrying."""
+        fatal = ["not enough balance", "not enough allowance", "insufficient"]
+        m = msg.lower()
+        return any(kw in m for kw in fatal)
 
     def _compute_shares(self) -> int:
         return max(1, int(self.config.trade_size))
@@ -718,24 +727,9 @@ class MLBLateLeaderRealStrategy:
         cfg = self.config
         if w.current_price <= 0:
             return
-        target = self._compute_shares()
+        shares = self._compute_shares()
         entry_price = w.current_price
         entry_time = datetime.now(timezone.utc)
-
-        # Check existing position — skip buy if already holding
-        if not self.dry_run:
-            current = await self._get_actual_shares(w.token_id)
-            if current > 0:
-                logger.info("[%s] Already holding %.3f shares — skip buy, monitoring for exit",
-                           w.label, current)
-                w.state = TokenState.IN_POSITION
-                w.entry_price = entry_price
-                w.shares = int(current)
-                self._open_trades[w.token_id] = entry_time
-                self._log_trade(w, "ENTRY_RESTORE", int(current), entry_price, 0, 0, entry_time)
-                return
-
-        shares = target
         stop_price = entry_price * (1.0 - cfg.stop_loss_pct)
         logger.info("[%s] ENTRY — price=%.4f shares=%d cost=$%.2f | SL=%.4f TP=%.4f",
                      w.label, entry_price, shares, shares * entry_price,
@@ -754,11 +748,10 @@ class MLBLateLeaderRealStrategy:
 
         # Live entry — FOK market order with retry + actual fill verification
         price_cents = int(round(entry_price * 100))
-        # Snapshot pre-existing position so we measure only the fill delta
-        pre_shares = await self._get_actual_shares(w.token_id) if not self.dry_run else 0.0
         max_retries = 3
         filled_shares = 0.0
         order_id = ""
+        fatal = False
         for attempt in range(max_retries):
             try:
                 resp = await self.client.place_order(
@@ -773,20 +766,19 @@ class MLBLateLeaderRealStrategy:
                 )
                 order_id = resp.get("order", {}).get("order_id", "")
             except Exception as e:
+                err_msg = str(e)
                 logger.error("[%s] Entry FOK rejected (attempt %d/%d): %s",
-                           w.label, attempt + 1, max_retries, e)
+                           w.label, attempt + 1, max_retries, err_msg)
+                if self._is_fatal_error(err_msg):
+                    logger.error("[%s] Fatal error — aborting entry", w.label)
+                    fatal = True; break
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
                 continue
 
-            # FOK succeeded — compute actual fill delta
-            await asyncio.sleep(1)
-            post_shares = await self._get_actual_shares(w.token_id)
-            filled_shares = post_shares - pre_shares
-            if filled_shares > 0:
-                break
-            logger.warning("[%s] Entry FOK OK but delta=%.3f (pre=%.3f post=%.3f) — retrying",
-                         w.label, filled_shares, pre_shares, post_shares)
+            # FOK returned OK — shares are bought (FOK is all-or-nothing)
+            filled_shares = shares
+            break
 
         if filled_shares > 0:
             actual = int(filled_shares)
@@ -801,7 +793,8 @@ class MLBLateLeaderRealStrategy:
         else:
             logger.error("[%s] Entry failed after %d attempts — will retry next scan",
                         w.label, max_retries)
-            w._skip_confirm = True  # skip confirmation on retry
+            if not fatal:
+                w._skip_confirm = True  # skip confirmation on retry
 
     @staticmethod
     def _normalize_token_id(token_id: str) -> str:
@@ -872,9 +865,10 @@ class MLBLateLeaderRealStrategy:
             self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
             return
 
-        # Live exit — FOK market order with position check + retry
+        # Live exit — FOK market order (FOK is atomic: success = position gone)
         max_retries = 3
         filled = False
+        fatal = False
         for attempt in range(max_retries):
             try:
                 await self.client.place_order(
@@ -885,21 +879,19 @@ class MLBLateLeaderRealStrategy:
                     count=sell_count,
                     type_="market",
                 )
+                # FOK returned OK — shares are sold (FOK is all-or-nothing)
+                filled = True
+                break
             except Exception as e:
+                err_msg = str(e)
                 logger.error("[%s] FOK rejected (attempt %d/%d): %s",
-                           w.label, attempt + 1, max_retries, e)
+                           w.label, attempt + 1, max_retries, err_msg)
+                if self._is_fatal_error(err_msg):
+                    logger.error("[%s] Fatal error — aborting exit", w.label)
+                    fatal = True; break
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
                 continue
-
-            # FOK returned OK — verify position cleared
-            await asyncio.sleep(1)
-            remaining = await self._get_actual_shares(w.token_id)
-            if remaining < 0.001:
-                filled = True
-                break
-            logger.warning("[%s] FOK OK but %.3f shares remain — retrying",
-                         w.label, remaining)
 
         if filled:
             print(f"  LIVE {reason}: SELL {actual_shares:.3f} {w.side.upper()} [{w.label}] "
@@ -913,5 +905,6 @@ class MLBLateLeaderRealStrategy:
         else:
             logger.error("[%s] Exit failed after %d attempts — retry next scan",
                         w.label, max_retries)
-            w._skip_confirm = True  # skip confirmation on retry
+            if not fatal:
+                w._skip_confirm = True  # skip confirmation on retry
             # Keep state IN_POSITION — next scan will detect signal again
