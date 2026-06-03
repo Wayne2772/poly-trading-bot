@@ -23,7 +23,7 @@ import re
 import time as _time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,15 +90,16 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class MLBLateLeaderRealConfig:
-    entry_delay_minutes: int = 60     # minutes after game start before entry allowed
-    entry_confidence: float = 0.55    # price must be > this to enter
-    take_profit_price: float = 0.93   # absolute price — exit when price >= this
+    entry_delay_minutes: int = 80     # minutes after game start before entry allowed
+    entry_confidence: float = 0.56    # price must be > this to enter
+    take_profit_price: float = 0.94   # absolute price — exit when price >= this
     stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
     game_over_high: float = 0.995     # game decided (win)
     game_over_low: float = 0.005      # game decided (loss)
     trade_size: float = 6             # shares per trade
-    poll_interval: int = 3            # seconds between price polls
-    max_games: int = 20               # max concurrent games to track
+    poll_interval: int = 1            # seconds between price polls
+    max_games: int = 10               # max concurrent games to track
+    max_concurrent_polls: int = 10    # parallel token price requests per scan
 
 
 # ---------------------------------------------------------------------------
@@ -126,20 +127,32 @@ class TokenWatcher:
     shares: int = 0
     order_id: str = ""
     pnl: float = 0.0
-    cooldown_scans: int = 0
-    _delay_warned: bool = field(default=False, repr=False)  # one-shot warning per token
+    pending_action: str = ""  # signal awaiting confirmation
+    pending_countdown: int = 0  # remaining confirmations needed (2 = two more scans)
+    _delay_warned: bool = field(default=False, repr=False)
+
+    def _confirm_next_scan(self, signal: str) -> Optional[str]:
+        """Return `signal` only after 2 consecutive re-confirmations (3 scans total)."""
+        if self.pending_action == signal and self.pending_countdown > 0:
+            self.pending_countdown -= 1
+            if self.pending_countdown == 0:
+                self.pending_action = ""; self.pending_countdown = 0
+                return signal
+            return None
+        self.pending_action = signal
+        self.pending_countdown = 2  # need 2 more confirmations
+        return None
 
     def update_price(
         self, price: float, cfg: "MLBLateLeaderRealConfig", now_ts: float,
     ) -> Optional[str]:
         """Return signal string or None. `now_ts` is current unix time."""
         self.current_price = price
-        if self.cooldown_scans > 0:
-            self.cooldown_scans -= 1
 
         if self.state == TokenState.WATCHING:
-            # Game-over check first
+            # Game-over check first (immediate — definitive)
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
+                self.pending_action = ""; self.pending_countdown = 0
                 return "GAME_OVER"
 
             # Entry delay: must be past game_start + entry_delay_minutes
@@ -166,22 +179,25 @@ class TokenWatcher:
                     self.state = TokenState.CLOSED
                 return None
 
-            # Past delay window — check entry condition
-            if self.cooldown_scans <= 0 and price > cfg.entry_confidence:
-                return "ENTRY"
+            # Past delay window — entry must have room to TP
+            if cfg.entry_confidence < price < cfg.take_profit_price:
+                return self._confirm_next_scan("ENTRY")
+            self.pending_action = ""; self.pending_countdown = 0
 
         elif self.state == TokenState.IN_POSITION:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
+                self.pending_action = ""; self.pending_countdown = 0
                 return "GAME_OVER"
 
             if self.entry_price > 0:
                 # Absolute take-profit
                 if price >= cfg.take_profit_price:
-                    return "EXIT_TP"
+                    return self._confirm_next_scan("EXIT_TP")
                 # Fixed stop-loss from entry
                 stop_price = self.entry_price * (1.0 - cfg.stop_loss_pct)
                 if price <= stop_price:
-                    return "EXIT_SL"
+                    return self._confirm_next_scan("EXIT_SL")
+            self.pending_action = ""; self.pending_countdown = 0
 
         return None
 
@@ -290,13 +306,29 @@ class MLBLateLeaderRealStrategy:
                             "game_start": game_ts,
                         })
 
-        # Sort by distance from now — in-progress and soon-starting first
+        # Filter: only today's games in UTC+8, then sort by priority
+        BEIJING = timezone(timedelta(hours=8))
         now = datetime.now(timezone.utc).timestamp()
+        now_dt = datetime.now(BEIJING)
+        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        today_end = today_start + 86400
+        GAME_MAX_SECONDS = 5 * 3600  # games >5h old are considered ended
+
+        # Keep today's games (UTC+8) + games with unknown start time
+        def _is_today(m: dict) -> bool:
+            ts = m.get("game_start") or 0
+            return ts == 0 or today_start <= ts < today_end
+        all_markets = [m for m in all_markets if _is_today(m)]
+
         def _sort_key(m: dict) -> tuple:
             ts = m.get("game_start") or 0
             if ts == 0:
-                return (2, 0)
-            return (0, abs(ts - now))
+                return (3, 0)                   # last: no start time
+            if ts <= now:
+                if now - ts < GAME_MAX_SECONDS:
+                    return (0, now - ts)         # 1st: in-progress, recent first
+                return (2, now - ts)             # 3rd: ended today
+            return (1, ts - now)                 # 2nd: upcoming, soonest first
 
         all_markets.sort(key=_sort_key)
         all_markets = all_markets[:self.config.max_games]
@@ -334,6 +366,19 @@ class MLBLateLeaderRealStrategy:
         except Exception:
             pass
         return None
+
+    async def _fetch_prices_batch(
+        self, tokens: list[tuple[str, TokenWatcher]],
+    ) -> list[tuple[str, TokenWatcher, Optional[float]]]:
+        """Fetch prices for multiple tokens in parallel with concurrency limit."""
+        sem = asyncio.Semaphore(self.config.max_concurrent_polls)
+
+        async def _one(token_id: str, w: TokenWatcher) -> tuple[str, TokenWatcher, Optional[float]]:
+            async with sem:
+                price = await self._fetch_token_price(token_id)
+            return token_id, w, price
+
+        return await asyncio.gather(*[_one(tid, w) for tid, w in tokens])
 
     def _write_price(self, token_id: str, w: TokenWatcher, price: float) -> None:
         """Append one price observation to the game's JSONL file."""
@@ -447,15 +492,20 @@ class MLBLateLeaderRealStrategy:
                 self._reload_blocklist()
                 now_ts = datetime.now(timezone.utc).timestamp()
 
-                for token_id, w in list(self.watchers.items()):
+                # Collect active (non-blocked, non-closed) tokens
+                active: list[tuple[str, TokenWatcher]] = []
+                for token_id, w in self.watchers.items():
                     if w.state == TokenState.CLOSED:
                         continue
+                    if self._blocked and (token_id in self._blocked or w.label.lower() in self._blocked):
+                        continue
+                    active.append((token_id, w))
 
-                    if self._blocked:
-                        if token_id in self._blocked or w.label.lower() in self._blocked:
-                            continue
+                # Parallel price fetch (semaphore-limited)
+                results = await self._fetch_prices_batch(active)
 
-                    price = await self._fetch_token_price(token_id)
+                # Sequential signal processing (avoids race conditions)
+                for token_id, w, price in results:
                     if price is None:
                         continue
 
@@ -616,9 +666,8 @@ class MLBLateLeaderRealStrategy:
         w.shares = 0
         w.order_id = ""
         w.pnl = 0.0
-        w.cooldown_scans = 5
         w._delay_warned = False  # re-check entry window on re-entry
-        logger.info("[%s] Reset to WATCHING — can re-enter after cooldown", w.label)
+        logger.info("[%s] Reset to WATCHING — ready for re-entry", w.label)
 
     def _compute_shares(self) -> int:
         return max(1, int(self.config.trade_size))
@@ -692,7 +741,7 @@ class MLBLateLeaderRealStrategy:
                 "side": w.side,
                 "action": "buy",
                 "count": shares,
-                "type_": "market",
+                "type_": "limit",
             }
             if w.side == "yes":
                 params["yes_price"] = price_cents
@@ -783,19 +832,37 @@ class MLBLateLeaderRealStrategy:
             self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
             return
 
-        try:
-            price_cents = int(round(exit_price * 100))
-            await self.client.place_order(
-                ticker=w.condition_id,
-                client_order_id=str(uuid.uuid4()),
-                side=w.side,
-                action="sell",
-                count=sell_count,
-                type_="limit",
-                yes_price=price_cents if w.side == "yes" else None,
-                no_price=price_cents if w.side == "no" else None,
-            )
-            print(f"  LIVE {reason}: SELL {w.shares} {w.side.upper()} [{w.label}] "
+        # Live exit — FOK market order with position check + retry
+        max_retries = 3
+        filled = False
+        for attempt in range(max_retries):
+            try:
+                await self.client.place_order(
+                    ticker=w.condition_id,
+                    client_order_id=str(uuid.uuid4()),
+                    side=w.side,
+                    action="sell",
+                    count=sell_count,
+                    type_="market",
+                )
+            except Exception as e:
+                logger.error("[%s] FOK rejected (attempt %d/%d): %s",
+                           w.label, attempt + 1, max_retries, e)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
+                continue
+
+            # FOK returned OK — verify position cleared
+            await asyncio.sleep(1)
+            remaining = await self._get_actual_shares(w.token_id)
+            if remaining < 0.001:
+                filled = True
+                break
+            logger.warning("[%s] FOK OK but %.3f shares remain — retrying",
+                         w.label, remaining)
+
+        if filled:
+            print(f"  LIVE {reason}: SELL {actual_shares:.3f} {w.side.upper()} [{w.label}] "
                   f"@ {exit_price:.4f} | PnL=${pnl:+.2f}")
             w.state = TokenState.CLOSED
             w.pnl = pnl
@@ -803,5 +870,7 @@ class MLBLateLeaderRealStrategy:
             if pnl > 0: self._total_wins += 1
             else: self._total_losses += 1
             self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
-        except Exception as e:
-            logger.error("[%s] Exit failed: %s", w.label, e)
+        else:
+            logger.error("[%s] Exit failed after %d attempts — retry next scan",
+                        w.label, max_retries)
+            # Keep state IN_POSITION — next scan will detect signal again
