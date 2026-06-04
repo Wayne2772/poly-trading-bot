@@ -11,7 +11,7 @@ Strategy:
 Differences from late_game_favorite:
   - entry_delay_minutes instead of immediate entry after discovery
   - Absolute take-profit price (0.93) instead of percentage from entry
-  - Fixed stop-loss from entry price instead of trailing stop
+  - Fixed stop-loss from entry_confidence baseline instead of entry price
   - No peak_price tracking (no trailing stop)
 """
 
@@ -23,7 +23,7 @@ import re
 import time as _time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,16 +90,16 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class MLBLateLeaderRealConfig:
-    entry_delay_minutes: int = 80     # minutes after game start before entry allowed
+    entry_delay_minutes: int = 60     # minutes after game start before entry allowed
     entry_confidence: float = 0.56    # price must be > this to enter
-    take_profit_price: float = 0.94   # absolute price — exit when price >= this
+    take_profit_price: float = 0.93   # absolute price — exit when price >= this
     stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
     game_over_high: float = 0.995     # game decided (win)
     game_over_low: float = 0.005      # game decided (loss)
     trade_size: float = 6             # shares per trade
     poll_interval: int = 1            # seconds between price polls
-    max_games: int = 10               # max concurrent games to track
-    max_concurrent_polls: int = 10    # parallel token price requests per scan
+    max_games: int = 9               # max concurrent games to track
+    max_concurrent_polls: int = 10    # 并发拉取 parallel token price requests per scan
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ class TokenWatcher:
     _delay_warned: bool = field(default=False, repr=False)
 
     def _confirm_next_scan(self, signal: str) -> Optional[str]:
-        """Return `signal` after 2 confirmations, or immediately if _skip_confirm."""
+        """Return `signal` after 1 confirmation (2 scans total), or immediately if _skip_confirm."""
         if self._skip_confirm:
             self._skip_confirm = False
             self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
@@ -145,7 +145,7 @@ class TokenWatcher:
                 return signal
             return None
         self.pending_action = signal
-        self.pending_countdown = 2  # need 2 more confirmations
+        self.pending_countdown = 1  # need 1 more confirmation (2 scans total)
         return None
 
     def update_price(
@@ -198,8 +198,8 @@ class TokenWatcher:
                 # Absolute take-profit
                 if price >= cfg.take_profit_price:
                     return self._confirm_next_scan("EXIT_TP")
-                # Fixed stop-loss from entry
-                stop_price = self.entry_price * (1.0 - cfg.stop_loss_pct)
+                # Fixed stop-loss from entry-confidence baseline
+                stop_price = cfg.entry_confidence * (1.0 - cfg.stop_loss_pct)
                 if price <= stop_price:
                     return self._confirm_next_scan("EXIT_SL")
             self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
@@ -311,19 +311,9 @@ class MLBLateLeaderRealStrategy:
                             "game_start": game_ts,
                         })
 
-        # Filter: only today's games in UTC+8, then sort by priority
-        BEIJING = timezone(timedelta(hours=8))
+        # Sort: in-progress first, then upcoming, then ended, then no-time
         now = datetime.now(timezone.utc).timestamp()
-        now_dt = datetime.now(BEIJING)
-        today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        today_end = today_start + 86400
         GAME_MAX_SECONDS = 5 * 3600  # games >5h old are considered ended
-
-        # Keep today's games (UTC+8) + games with unknown start time
-        def _is_today(m: dict) -> bool:
-            ts = m.get("game_start") or 0
-            return ts == 0 or today_start <= ts < today_end
-        all_markets = [m for m in all_markets if _is_today(m)]
 
         def _sort_key(m: dict) -> tuple:
             ts = m.get("game_start") or 0
@@ -332,7 +322,7 @@ class MLBLateLeaderRealStrategy:
             if ts <= now:
                 if now - ts < GAME_MAX_SECONDS:
                     return (0, now - ts)         # 1st: in-progress, recent first
-                return (2, now - ts)             # 3rd: ended today
+                return (2, now - ts)             # 3rd: ended
             return (1, ts - now)                 # 2nd: upcoming, soonest first
 
         all_markets.sort(key=_sort_key)
@@ -623,7 +613,14 @@ class MLBLateLeaderRealStrategy:
             size = int(float(p.get("size", 0)))
             avg_price = float(p.get("avg_price", 0))
 
+            # Match by normalized token_id (Gamma=hex, Data API=decimal)
+            dec_tid = self._normalize_token_id(token_id)
             w = self.watchers.get(token_id)
+            if w is None:
+                for tid, cand in self.watchers.items():
+                    if self._normalize_token_id(tid) == dec_tid:
+                        w = cand
+                        break
             if w is None:
                 self.watchers[token_id] = TokenWatcher(
                     token_id=token_id, condition_id=cond,
@@ -730,15 +727,15 @@ class MLBLateLeaderRealStrategy:
         shares = self._compute_shares()
         entry_price = w.current_price
         entry_time = datetime.now(timezone.utc)
-        stop_price = entry_price * (1.0 - cfg.stop_loss_pct)
+        sl_price = cfg.entry_confidence * (1.0 - cfg.stop_loss_pct)
         logger.info("[%s] ENTRY — price=%.4f shares=%d cost=$%.2f | SL=%.4f TP=%.4f",
                      w.label, entry_price, shares, shares * entry_price,
-                     stop_price, cfg.take_profit_price)
+                     sl_price, cfg.take_profit_price)
 
         if self.dry_run:
             print(f"  [DRY] BUY {shares} {w.side.upper()} [{w.label}] "
                   f"@ {entry_price:.4f} (~${shares * entry_price:.2f}) | SL=%.4f TP=%.4f"
-                  % (stop_price, cfg.take_profit_price))
+                  % (sl_price, cfg.take_profit_price))
             w.state = TokenState.IN_POSITION
             w.entry_price = entry_price
             w.shares = shares
@@ -748,7 +745,7 @@ class MLBLateLeaderRealStrategy:
 
         # Live entry — FOK market order with retry + actual fill verification
         price_cents = int(round(entry_price * 100))
-        max_retries = 3
+        max_retries = 2
         filled_shares = 0.0
         order_id = ""
         fatal = False
@@ -866,7 +863,7 @@ class MLBLateLeaderRealStrategy:
             return
 
         # Live exit — FOK market order (FOK is atomic: success = position gone)
-        max_retries = 3
+        max_retries = 2
         filled = False
         fatal = False
         for attempt in range(max_retries):
