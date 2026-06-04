@@ -94,9 +94,9 @@ class MLBLateLeaderRealConfig:
     entry_confidence: float = 0.56    # price must be > this to enter
     take_profit_price: float = 0.93   # absolute price — exit when price >= this
     stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
-    game_over_high: float = 0.995     # game decided (win)
-    game_over_low: float = 0.005      # game decided (loss)
-    trade_size: float = 6             # shares per trade
+    game_over_high: float = 0.997     # game decided (win)
+    game_over_low: float = 0.003      # game decided (loss)
+    trade_size: float = 10             # shares per trade
     poll_interval: int = 1            # seconds between price polls
     max_games: int = 5               # max concurrent games to track
     max_concurrent_polls: int = 10    # 并发拉取 parallel token price requests per scan

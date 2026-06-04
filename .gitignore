@@ -8,6 +8,7 @@ secrets.json
 # Polymarket-related local artifacts
 data/token_cache.json
 config.json
+output/
 
 # Database files
 *.db
