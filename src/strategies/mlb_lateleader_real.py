@@ -98,7 +98,7 @@ class MLBLateLeaderRealConfig:
     game_over_low: float = 0.005      # game decided (loss)
     trade_size: float = 6             # shares per trade
     poll_interval: int = 1            # seconds between price polls
-    max_games: int = 9               # max concurrent games to track
+    max_games: int = 5               # max concurrent games to track
     max_concurrent_polls: int = 10    # 并发拉取 parallel token price requests per scan
 
 
@@ -530,9 +530,13 @@ class MLBLateLeaderRealStrategy:
                         w.state = TokenState.CLOSED
                     elif signal in ("EXIT_TP", "EXIT_SL"):
                         await self._handle_exit(w, signal)
-                        # Only reset for re-entry if exit actually succeeded
+                        # Re-entry: only after stop-loss (price has room to grow).
+                        # After take-profit, price is near 0.93 — no upside left.
                         if w.state == TokenState.CLOSED and 0.01 < price < 0.99:
-                            self._reset_watcher(w)
+                            if signal == "EXIT_SL":
+                                self._reset_watcher(w)
+                            else:
+                                logger.info("[%s] TP reached — not re-entering at high price", w.label)
 
                 scan_count += 1
                 if scan_count % 12 == 0:
