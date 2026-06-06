@@ -91,14 +91,15 @@ def _is_mlb_moneyline(title: str) -> bool:
 @dataclass
 class MLBLateLeaderRealConfig:
     entry_delay_minutes: int = 60     # minutes after game start before entry allowed
-    entry_confidence: float = 0.56    # price must be > this to enter
-    take_profit_price: float = 0.93   # absolute price — exit when price >= this
+    entry_confidence: float = 0.555   # price must be > this to enter
+    take_profit_price: float = 0.925  # absolute price — exit when price >= this
     stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
+    entry_confidence_after_sl: float = 0.70  # raised entry bar after a stop-loss
     game_over_high: float = 0.997     # game decided (win)
     game_over_low: float = 0.003      # game decided (loss)
-    trade_size: float = 10             # shares per trade
+    trade_size: float = 10            # shares per trade
     poll_interval: int = 1            # seconds between price polls
-    max_games: int = 5               # max concurrent games to track
+    max_games: int = 10                # max concurrent games to track
     max_concurrent_polls: int = 10    # 并发拉取 parallel token price requests per scan
 
 
@@ -131,6 +132,7 @@ class TokenWatcher:
     pending_countdown: int = 0  # remaining confirmations needed (2 = two more scans)
     _skip_confirm: bool = field(default=False, repr=False)  # skip confirmation after FOK failure
     _delay_warned: bool = field(default=False, repr=False)
+    effective_entry_bar: float = 0.0  # dynamic entry threshold (0 = use config default)
 
     def _confirm_next_scan(self, signal: str) -> Optional[str]:
         """Return `signal` after 1 confirmation (2 scans total), or immediately if _skip_confirm."""
@@ -185,7 +187,8 @@ class TokenWatcher:
                 return None
 
             # Past delay window — entry must have room to TP
-            if cfg.entry_confidence < price < cfg.take_profit_price:
+            bar = self.effective_entry_bar if self.effective_entry_bar > 0 else cfg.entry_confidence
+            if bar < price < cfg.take_profit_price:
                 return self._confirm_next_scan("ENTRY")
             self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
 
@@ -749,7 +752,7 @@ class MLBLateLeaderRealStrategy:
 
         # Live entry — FOK market order with retry + actual fill verification
         price_cents = int(round(entry_price * 100))
-        max_retries = 2
+        max_retries = 1
         filled_shares = 0.0
         order_id = ""
         fatal = False
@@ -864,10 +867,13 @@ class MLBLateLeaderRealStrategy:
             if pnl > 0: self._total_wins += 1
             else: self._total_losses += 1
             self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
+            if signal == "EXIT_SL":
+                w.effective_entry_bar = self.config.entry_confidence_after_sl
+                logger.info("[%s] SL exit — raised entry bar to %.2f", w.label, w.effective_entry_bar)
             return
 
         # Live exit — FOK market order (FOK is atomic: success = position gone)
-        max_retries = 2
+        max_retries = 1
         filled = False
         fatal = False
         for attempt in range(max_retries):
@@ -903,6 +909,9 @@ class MLBLateLeaderRealStrategy:
             if pnl > 0: self._total_wins += 1
             else: self._total_losses += 1
             self._log_trade(w, signal, actual_shares, exit_price, pnl, pnl_pct, exit_time)
+            if signal == "EXIT_SL":
+                w.effective_entry_bar = self.config.entry_confidence_after_sl
+                logger.info("[%s] SL exit — raised entry bar to %.2f", w.label, w.effective_entry_bar)
         else:
             logger.error("[%s] Exit failed after %d attempts — retry next scan",
                         w.label, max_retries)
