@@ -206,6 +206,7 @@ class LateGameFavoriteStrategy:
         self._realized_pnl: float = 0.0
         self._total_wins: int = 0
         self._total_losses: int = 0
+        self._http: Optional[httpx.AsyncClient] = None  # shared session for price polls
 
     # ------------------------------------------------------------------
     # Market discovery
@@ -311,15 +312,15 @@ class LateGameFavoriteStrategy:
     # ------------------------------------------------------------------
 
     async def _fetch_token_price(self, token_id: str) -> Optional[float]:
+        """Fetch midpoint price. Uses shared http session for connection reuse."""
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as sess:
-                r = await sess.get(
-                    "https://clob.polymarket.com/midpoint",
-                    params={"token_id": token_id, "_": int(_time.time() * 1000)},
-                )
-                if r.status_code == 200:
-                    v = r.json().get("mid")
-                    return float(v) if v is not None else None
+            r = await self._http.get(
+                "https://clob.polymarket.com/midpoint",
+                params={"token_id": token_id, "_": int(_time.time() * 1000)},
+            )
+            if r.status_code == 200:
+                v = r.json().get("mid")
+                return float(v) if v is not None else None
         except Exception:
             pass
         return None
@@ -329,6 +330,10 @@ class LateGameFavoriteStrategy:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
         self._running = True
         cfg = self.config
         mode = "DRY RUN" if self.dry_run else "LIVE"
@@ -448,6 +453,8 @@ class LateGameFavoriteStrategy:
 
         self._print_summary()
 
+        if self._http:
+            await self._http.aclose()
         if self._owns_gamma:
             try:
                 await self.gamma.close()

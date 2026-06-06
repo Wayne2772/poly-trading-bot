@@ -90,17 +90,17 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class MLBLateLeaderRealConfig:
-    entry_delay_minutes: int = 60     # minutes after game start before entry allowed
-    entry_confidence: float = 0.555   # price must be > this to enter
-    take_profit_price: float = 0.925  # absolute price — exit when price >= this
-    stop_loss_pct: float = 0.15       # fixed % below entry: exit when price <= entry * (1 - this)
-    entry_confidence_after_sl: float = 0.70  # raised entry bar after a stop-loss
-    game_over_high: float = 0.997     # game decided (win)
-    game_over_low: float = 0.003      # game decided (loss)
-    trade_size: float = 10            # shares per trade
-    poll_interval: int = 1            # seconds between price polls
-    max_games: int = 10                # max concurrent games to track
-    max_concurrent_polls: int = 10    # 并发拉取 parallel token price requests per scan
+    entry_delay_minutes: int = 60             # minutes after game start before entry allowed
+    entry_confidence: float = 0.555           # price must be > this to enter
+    entry_confidence_after_sl: float = 0.705  # raised entry bar after a stop-loss
+    take_profit_price: float = 0.925          # absolute price — exit when price >= this
+    stop_loss_pct: float = 0.14               # fixed % below entry: exit when price <= entry * (1 - this)
+    game_over_high: float = 0.997             # game decided (win)
+    game_over_low: float = 0.003              # game decided (loss)
+    trade_size: float = 20                    # shares per trade
+    poll_interval: int = 1                    # seconds between price polls
+    max_games: int = 10                       # max concurrent games to track
+    max_concurrent_polls: int = 10            # 并发拉取 parallel token price requests per scan
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +243,7 @@ class MLBLateLeaderRealStrategy:
         self._realized_pnl: float = 0.0
         self._total_wins: int = 0
         self._total_losses: int = 0
+        self._http: Optional[httpx.AsyncClient] = None  # shared session for price polls
 
     # ------------------------------------------------------------------
     # Market discovery
@@ -352,15 +353,15 @@ class MLBLateLeaderRealStrategy:
     # ------------------------------------------------------------------
 
     async def _fetch_token_price(self, token_id: str) -> Optional[float]:
+        """Fetch midpoint price. Uses shared http session for connection reuse."""
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as sess:
-                r = await sess.get(
-                    "https://clob.polymarket.com/midpoint",
-                    params={"token_id": token_id, "_": int(_time.time() * 1000)},
-                )
-                if r.status_code == 200:
-                    v = r.json().get("mid")
-                    return float(v) if v is not None else None
+            r = await self._http.get(
+                "https://clob.polymarket.com/midpoint",
+                params={"token_id": token_id, "_": int(_time.time() * 1000)},
+            )
+            if r.status_code == 200:
+                v = r.json().get("mid")
+                return float(v) if v is not None else None
         except Exception:
             pass
         return None
@@ -401,6 +402,10 @@ class MLBLateLeaderRealStrategy:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
+        self._http = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+        )
         self._running = True
         cfg = self.config
         mode = "DRY RUN" if self.dry_run else "LIVE"
@@ -564,6 +569,8 @@ class MLBLateLeaderRealStrategy:
 
         self._print_summary()
 
+        if self._http:
+            await self._http.aclose()
         if self._owns_gamma:
             try:
                 await self.gamma.close()
