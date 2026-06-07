@@ -92,14 +92,14 @@ def _is_mlb_moneyline(title: str) -> bool:
 class MLBLateLeaderRealConfig:
     entry_delay_minutes: int = 60             # minutes after game start before entry allowed
     entry_confidence: float = 0.555           # price must be > this to enter
-    entry_confidence_after_sl: float = 0.705  # raised entry bar after a stop-loss
-    take_profit_price: float = 0.925          # absolute price — exit when price >= this
-    stop_loss_pct: float = 0.14               # fixed % below entry: exit when price <= entry * (1 - this)
+    entry_confidence_after_sl: float = 0.825  # raised entry bar after a stop-loss
+    take_profit_price: float = 0.935          # absolute price — exit when price >= this
+    stop_loss_pct: float = 0.10               # fixed % below entry: exit when price <= entry * (1 - this)
     game_over_high: float = 0.997             # game decided (win)
     game_over_low: float = 0.003              # game decided (loss)
-    trade_size: float = 20                    # shares per trade
+    trade_size: float = 10                    # shares per trade
     poll_interval: int = 1                    # seconds between price polls
-    max_games: int = 10                       # max concurrent games to track
+    max_games: int = 15                        # max concurrent games to track
     max_concurrent_polls: int = 10            # 并发拉取 parallel token price requests per scan
 
 
@@ -175,6 +175,12 @@ class TokenWatcher:
                         )
                         self._delay_warned = True
                     return None
+                elif self._delay_warned:
+                    logger.info(
+                        "[%s] Entry window OPEN — monitoring for price > %.3f and < %.3f",
+                        self.label, cfg.entry_confidence, cfg.take_profit_price,
+                    )
+                    self._delay_warned = False  # reset so it prints once when window opens
             else:
                 # No game start time — skip this token permanently
                 if not self._delay_warned:
@@ -353,17 +359,30 @@ class MLBLateLeaderRealStrategy:
     # ------------------------------------------------------------------
 
     async def _fetch_token_price(self, token_id: str) -> Optional[float]:
-        """Fetch midpoint price. Uses shared http session for connection reuse."""
-        try:
-            r = await self._http.get(
-                "https://clob.polymarket.com/midpoint",
-                params={"token_id": token_id, "_": int(_time.time() * 1000)},
-            )
-            if r.status_code == 200:
-                v = r.json().get("mid")
-                return float(v) if v is not None else None
-        except Exception:
-            pass
+        """Fetch midpoint price. Uses shared http session with stale-connection retry."""
+        for attempt in range(2):
+            try:
+                r = await self._http.get(
+                    "https://clob.polymarket.com/midpoint",
+                    params={"token_id": token_id, "_": int(_time.time() * 1000)},
+                )
+                if r.status_code == 200:
+                    v = r.json().get("mid")
+                    return float(v) if v is not None else None
+            except Exception:
+                if attempt == 0:
+                    # Stale pooled connection — close and retry once
+                    try:
+                        await self._http.aclose()
+                    except Exception:
+                        pass
+                    self._http = httpx.AsyncClient(
+                        timeout=httpx.Timeout(8.0),
+                        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50,
+                                            keepalive_expiry=30),
+                    )
+                else:
+                    logger.debug("[_fetch_token_price] failed for %s", token_id[:16])
         return None
 
     async def _fetch_prices_batch(
@@ -404,7 +423,8 @@ class MLBLateLeaderRealStrategy:
     async def run(self) -> None:
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(8.0),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50,
+                                keepalive_expiry=30),
         )
         self._running = True
         cfg = self.config
@@ -547,7 +567,7 @@ class MLBLateLeaderRealStrategy:
                                 logger.info("[%s] TP reached — not re-entering at high price", w.label)
 
                 scan_count += 1
-                if scan_count % 12 == 0:
+                if scan_count % 180 == 0:
                     active = sum(1 for w in self.watchers.values() if w.state == TokenState.WATCHING)
                     in_pos = sum(1 for w in self.watchers.values() if w.state == TokenState.IN_POSITION)
                     closed = sum(1 for w in self.watchers.values() if w.state == TokenState.CLOSED)
