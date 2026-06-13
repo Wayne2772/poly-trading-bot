@@ -54,6 +54,8 @@ SKIP_TITLE_KEYWORDS = [
     "run line", "world series", "pennant", "mvp", "championship",
     "division winner", "playoffs", "all-star", "home run", "strikeout",
     "hits", "rbi", "first inning", "first pitch", "national anthem",
+    "extra innings", "first team to score", "grand slam", "shutout",
+    "no hitter", "inning", "tied after", "lead after",
 ]
 
 
@@ -90,16 +92,16 @@ def _is_mlb_moneyline(title: str) -> bool:
 
 @dataclass
 class MLBLateLeaderRealConfig:
-    entry_delay_minutes: int = 60             # minutes after game start before entry allowed
-    entry_confidence: float = 0.555           # price must be > this to enter
-    entry_confidence_after_sl: float = 0.825  # raised entry bar after a stop-loss
-    take_profit_price: float = 0.935          # absolute price — exit when price >= this
-    stop_loss_pct: float = 0.10               # fixed % below entry: exit when price <= entry * (1 - this)
+    entry_delay_minutes: int = 100             # minutes after game start before entry allowed
+    entry_confidence: float = 0.85             # price must be > this to enter
+    entry_confidence_after_sl: float = 0.94  # raised entry bar after a stop-loss
+    take_profit_price: float = 0.99          # absolute price — exit when price >= this
+    stop_loss_pct: float = 0.13              # fixed % below entry: exit when price <= entry * (1 - this)
     game_over_high: float = 0.997             # game decided (win)
     game_over_low: float = 0.003              # game decided (loss)
-    trade_size: float = 10                    # shares per trade
+    trade_size: float = 6                     # shares per trade
     poll_interval: int = 1                    # seconds between price polls
-    max_games: int = 15                        # max concurrent games to track
+    max_games: int = 10                        # max concurrent games to track
     max_concurrent_polls: int = 10            # 并发拉取 parallel token price requests per scan
 
 
@@ -128,27 +130,8 @@ class TokenWatcher:
     shares: int = 0
     order_id: str = ""
     pnl: float = 0.0
-    pending_action: str = ""  # signal awaiting confirmation
-    pending_countdown: int = 0  # remaining confirmations needed (2 = two more scans)
-    _skip_confirm: bool = field(default=False, repr=False)  # skip confirmation after FOK failure
     _delay_warned: bool = field(default=False, repr=False)
     effective_entry_bar: float = 0.0  # dynamic entry threshold (0 = use config default)
-
-    def _confirm_next_scan(self, signal: str) -> Optional[str]:
-        """Return `signal` after 1 confirmation (2 scans total), or immediately if _skip_confirm."""
-        if self._skip_confirm:
-            self._skip_confirm = False
-            self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
-            return signal
-        if self.pending_action == signal and self.pending_countdown > 0:
-            self.pending_countdown -= 1
-            if self.pending_countdown == 0:
-                self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
-                return signal
-            return None
-        self.pending_action = signal
-        self.pending_countdown = 1  # need 1 more confirmation (2 scans total)
-        return None
 
     def update_price(
         self, price: float, cfg: "MLBLateLeaderRealConfig", now_ts: float,
@@ -159,7 +142,6 @@ class TokenWatcher:
         if self.state == TokenState.WATCHING:
             # Game-over check first (immediate — definitive)
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
                 return "GAME_OVER"
 
             # Entry delay: must be past game_start + entry_delay_minutes
@@ -195,23 +177,20 @@ class TokenWatcher:
             # Past delay window — entry must have room to TP
             bar = self.effective_entry_bar if self.effective_entry_bar > 0 else cfg.entry_confidence
             if bar < price < cfg.take_profit_price:
-                return self._confirm_next_scan("ENTRY")
-            self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
+                return "ENTRY"
 
         elif self.state == TokenState.IN_POSITION:
             if price <= cfg.game_over_low or price >= cfg.game_over_high:
-                self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
                 return "GAME_OVER"
 
             if self.entry_price > 0:
                 # Absolute take-profit
                 if price >= cfg.take_profit_price:
-                    return self._confirm_next_scan("EXIT_TP")
+                    return "EXIT_TP"
                 # Fixed stop-loss from entry-confidence baseline
                 stop_price = cfg.entry_confidence * (1.0 - cfg.stop_loss_pct)
                 if price <= stop_price:
-                    return self._confirm_next_scan("EXIT_SL")
-            self.pending_action = ""; self.pending_countdown = 0; self._skip_confirm = False
+                    return "EXIT_SL"
 
         return None
 
@@ -321,18 +300,22 @@ class MLBLateLeaderRealStrategy:
                             "game_start": game_ts,
                         })
 
-        # Sort: in-progress first, then upcoming, then ended, then no-time
+        # Filter out ended games (started >5h ago) so they don't waste slots
         now = datetime.now(timezone.utc).timestamp()
-        GAME_MAX_SECONDS = 5 * 3600  # games >5h old are considered ended
+        GAME_MAX_SECONDS = 5 * 3600
+
+        all_markets = [m for m in all_markets if (
+            (m.get("game_start") or 0) == 0 or          # unknown time: keep
+            now - (m.get("game_start") or 0) < GAME_MAX_SECONDS or  # in-progress
+            (m.get("game_start") or 0) > now            # upcoming
+        )]
 
         def _sort_key(m: dict) -> tuple:
             ts = m.get("game_start") or 0
             if ts == 0:
-                return (3, 0)                   # last: no start time
+                return (2, 0)                   # last: no start time
             if ts <= now:
-                if now - ts < GAME_MAX_SECONDS:
-                    return (0, now - ts)         # 1st: in-progress, recent first
-                return (2, now - ts)             # 3rd: ended
+                return (0, now - ts)             # 1st: in-progress, recent first
             return (1, ts - now)                 # 2nd: upcoming, soonest first
 
         all_markets.sort(key=_sort_key)
@@ -703,7 +686,6 @@ class MLBLateLeaderRealStrategy:
         w.shares = 0
         w.order_id = ""
         w.pnl = 0.0
-        w.pending_action = ""; w.pending_countdown = 0; w._skip_confirm = False
         w._delay_warned = False  # re-check entry window on re-entry
         logger.info("[%s] Reset to WATCHING — ready for re-entry", w.label)
 
@@ -782,7 +764,6 @@ class MLBLateLeaderRealStrategy:
         max_retries = 1
         filled_shares = 0.0
         order_id = ""
-        fatal = False
         for attempt in range(max_retries):
             try:
                 resp = await self.client.place_order(
@@ -802,7 +783,7 @@ class MLBLateLeaderRealStrategy:
                            w.label, attempt + 1, max_retries, err_msg)
                 if self._is_fatal_error(err_msg):
                     logger.error("[%s] Fatal error — aborting entry", w.label)
-                    fatal = True; break
+                    break
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
                 continue
@@ -824,8 +805,7 @@ class MLBLateLeaderRealStrategy:
         else:
             logger.error("[%s] Entry failed after %d attempts — will retry next scan",
                         w.label, max_retries)
-            if not fatal:
-                w._skip_confirm = True  # skip confirmation on retry
+            # will retry next scan
 
     @staticmethod
     def _normalize_token_id(token_id: str) -> str:
@@ -902,7 +882,6 @@ class MLBLateLeaderRealStrategy:
         # Live exit — FOK market order (FOK is atomic: success = position gone)
         max_retries = 1
         filled = False
-        fatal = False
         for attempt in range(max_retries):
             try:
                 await self.client.place_order(
@@ -922,7 +901,7 @@ class MLBLateLeaderRealStrategy:
                            w.label, attempt + 1, max_retries, err_msg)
                 if self._is_fatal_error(err_msg):
                     logger.error("[%s] Fatal error — aborting exit", w.label)
-                    fatal = True; break
+                    break
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
                 continue
@@ -942,6 +921,5 @@ class MLBLateLeaderRealStrategy:
         else:
             logger.error("[%s] Exit failed after %d attempts — retry next scan",
                         w.label, max_retries)
-            if not fatal:
-                w._skip_confirm = True  # skip confirmation on retry
+            # will retry next scan
             # Keep state IN_POSITION — next scan will detect signal again

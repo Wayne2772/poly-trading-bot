@@ -1,0 +1,5 @@
+# Late-game strategy blocklist
+# One token_id or team label per line. Reloaded every scan.
+# Examples:
+#  0x1693f7db49c42f...ignore-this-token
+#  dodgers (away)
